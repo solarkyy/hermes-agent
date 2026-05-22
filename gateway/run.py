@@ -53,6 +53,17 @@ from typing import Dict, Optional, Any, List, Union
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import safe_schedule_threadsafe
 from agent.i18n import t
+
+# Council integration
+try:
+    import sys as _sys_council
+    _sys_council.path.insert(0, os.path.expanduser("~/.hermes/lib"))
+    from council_bridge import post_to_council as _post_to_council
+    _COUNCIL_AVAILABLE = True
+except ImportError:
+    _COUNCIL_AVAILABLE = False
+    _post_to_council = lambda *a, **k: None
+
 from hermes_cli.config import cfg_get
 
 # --- Agent cache tuning ---------------------------------------------------

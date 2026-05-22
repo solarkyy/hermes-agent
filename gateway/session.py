@@ -102,9 +102,11 @@ class SessionSource:
         if self.chat_type == "dm":
             parts.append(f"DM with {self.user_name or self.user_id or 'user'}")
         elif self.chat_type == "group":
-            parts.append(f"group: {self.chat_name or self.chat_id}")
+            sender_desc = f" (from {self.user_name or self.user_id or 'user'})" if (self.user_name or self.user_id) else ""
+            parts.append(f"group: {self.chat_name or self.chat_id}{sender_desc}")
         elif self.chat_type == "channel":
-            parts.append(f"channel: {self.chat_name or self.chat_id}")
+            sender_desc = f" (from {self.user_name or self.user_id or 'user'})" if (self.user_name or self.user_id) else ""
+            parts.append(f"channel: {self.chat_name or self.chat_id}{sender_desc}")
         else:
             parts.append(self.chat_name or self.chat_id)
         

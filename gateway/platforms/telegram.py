@@ -4483,6 +4483,44 @@ class TelegramAdapter(BasePlatformAdapter):
         mentioned_bot_usernames = self._extract_bot_mention_usernames(message)
         return bool(mentioned_bot_usernames) and bot_username not in mentioned_bot_usernames
 
+    def _message_mentions_sister_bot(self, message: Message) -> bool:
+        """Return True if message mentions a sister bot without also mentioning Hermes.
+
+        Guards against voice-leakage: when a group message addresses @EdgeOmniraBot
+        or @EvoOmniraBot (but NOT @OMNIRA01_bot), Hermes stays silent rather than
+        simulating another surface's voice.
+
+        Sister bot usernames are configured via the HERMES_SISTER_BOT_USERNAMES env
+        var (comma-separated, with or without leading @).
+        """
+        raw = os.getenv("HERMES_SISTER_BOT_USERNAMES", "")
+        if not raw:
+            return False
+        sister_usernames = {u.strip().lstrip("@").lower() for u in raw.split(",") if u.strip()}
+        if not sister_usernames:
+            return False
+
+        # If Hermes herself is mentioned, this message is for her — let it through.
+        if self._message_mentions_bot(message):
+            return False
+
+        def _iter_sources():
+            yield getattr(message, "text", None) or "", getattr(message, "entities", None) or []
+            yield getattr(message, "caption", None) or "", getattr(message, "caption_entities", None) or []
+
+        for source_text, entities in _iter_sources():
+            for entity in entities:
+                entity_type = str(getattr(entity, "type", "")).split(".")[-1].lower()
+                if entity_type == "mention":
+                    offset = int(getattr(entity, "offset", -1))
+                    length = int(getattr(entity, "length", 0))
+                    if offset < 0 or length <= 0:
+                        continue
+                    mentioned = source_text[offset:offset + length].strip().lstrip("@").lower()
+                    if mentioned in sister_usernames:
+                        return True
+        return False
+
     def _message_matches_mention_patterns(self, message: Message) -> bool:
         if not self._mention_patterns:
             return False
@@ -4697,6 +4735,12 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         if chat_id_str in self._telegram_free_response_chats():
             return True
+        # ── Sister-bot voice-leakage guard ──────────────────────────
+        # When a group message mentions @EdgeOmniraBot or @EvoOmniraBot
+        # WITHOUT mentioning Hermes, skip processing — this message is
+        # for another surface, not the voice seat.
+        if self._message_mentions_sister_bot(message):
+            return False
         if not self._telegram_require_mention():
             return True
         if self._is_reply_to_bot(message):
