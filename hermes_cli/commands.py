@@ -63,6 +63,14 @@ class CommandDef:
 
 COMMAND_REGISTRY: list[CommandDef] = [
     # Session
+    CommandDef(
+        "login",
+        "Login for provider-backed Hermes sessions",
+        "Configuration",
+        args_hint="[login|refresh|status|logout] [provider flags]",
+        cli_only=True,
+        subcommands=("login", "refresh", "status", "logout"),
+    ),
     CommandDef("start", "Acknowledge platform start pings without a reply", "Session",
                gateway_only=True),
     CommandDef("new", "Start a new session (fresh session ID + history)", "Session",
