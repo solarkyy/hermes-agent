@@ -928,7 +928,7 @@ def load_gateway_config() -> GatewayConfig:
                 plat_data, extra = _ensure_platform_extra_dict(platforms_data, plat.value)
                 if enabled_was_explicit:
                     plat_data["enabled"] = platform_cfg["enabled"]
-                if plat == Platform.SLACK and enabled_was_explicit:
+                if plat in {Platform.SLACK, Platform.TELEGRAM} and enabled_was_explicit:
                     extra["_enabled_explicit"] = True
                 extra.update(bridged)
 
@@ -1289,6 +1289,8 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
     if telegram_token:
         telegram_config = _enable_from_env(Platform.TELEGRAM)
+        # Keep token available for explicit outbound/fallback sends even when
+        # the gateway adapter is disabled by config.
         telegram_config.token = telegram_token
     
     # Reply threading mode for Telegram (off/first/all)

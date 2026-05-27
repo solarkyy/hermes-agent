@@ -273,6 +273,43 @@ class TestLoadGatewayConfig:
 
         assert config.quick_commands == {"limits": {"type": "exec", "command": "echo ok"}}
 
+    def test_explicit_top_level_telegram_enabled_false_wins_over_env_token(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text("telegram:\n  enabled: false\n", encoding="utf-8")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+
+        config = load_gateway_config()
+
+        telegram_config = config.platforms[Platform.TELEGRAM]
+        assert telegram_config.enabled is False
+        assert telegram_config.token == "test-token"
+        assert "_enabled_explicit" not in telegram_config.extra
+
+    def test_explicit_platforms_telegram_enabled_false_wins_over_env_token(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    enabled: false\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+
+        config = load_gateway_config()
+
+        telegram_config = config.platforms[Platform.TELEGRAM]
+        assert telegram_config.enabled is False
+        assert telegram_config.token == "test-token"
+        assert "_enabled_explicit" not in telegram_config.extra
+
     def test_bridges_group_sessions_per_user_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
