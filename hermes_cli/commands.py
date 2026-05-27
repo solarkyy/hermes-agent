@@ -63,6 +63,14 @@ class CommandDef:
 
 COMMAND_REGISTRY: list[CommandDef] = [
     # Session
+    CommandDef(
+        "login",
+        "Login for provider-backed Hermes sessions",
+        "Configuration",
+        args_hint="[login|refresh|status|logout] [provider flags]",
+        cli_only=True,
+        subcommands=("login", "refresh", "status", "logout"),
+    ),
     CommandDef("new", "Start a new session (fresh session ID + history)", "Session",
                aliases=("reset",), args_hint="[name]"),
     CommandDef("topic", "Enable or inspect Telegram DM topic sessions", "Session",
