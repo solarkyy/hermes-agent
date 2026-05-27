@@ -76,6 +76,15 @@ _HERMES_CORE_TOOLS = [
 # Core toolset definitions
 # These can include individual tools or reference other toolsets
 TOOLSETS = {
+    # Explicit no-tool mode for local/chat-only models and smoke tests.
+    # Useful for endpoints that reject OpenAI tool schemas (many Ollama
+    # Modelfiles and llama.cpp/llama-server deployments).
+    "none": {
+        "description": "No tools. Chat-only mode for local models and smoke tests.",
+        "tools": [],
+        "includes": []
+    },
+
     # Basic toolsets - individual tool categories
     "web": {
         "description": "Web research and content extraction tools",
