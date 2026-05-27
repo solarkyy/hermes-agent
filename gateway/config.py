@@ -777,7 +777,7 @@ def load_gateway_config() -> GatewayConfig:
                         existing = {}
                     # Deep-merge extra dicts so gateway.json defaults survive
                     merged_extra = {**existing.get("extra", {}), **plat_block.get("extra", {})}
-                    if plat_name == Platform.SLACK.value and "enabled" in plat_block:
+                    if plat_name in {Platform.SLACK.value, Platform.TELEGRAM.value} and "enabled" in plat_block:
                         merged_extra["_enabled_explicit"] = True
                     merged = {**existing, **plat_block}
                     if merged_extra:
@@ -874,7 +874,7 @@ def load_gateway_config() -> GatewayConfig:
                 plat_data, extra = _ensure_platform_extra_dict(platforms_data, plat.value)
                 if enabled_was_explicit:
                     plat_data["enabled"] = platform_cfg["enabled"]
-                if plat == Platform.SLACK and enabled_was_explicit:
+                if plat in {Platform.SLACK, Platform.TELEGRAM} and enabled_was_explicit:
                     extra["_enabled_explicit"] = True
                 extra.update(bridged)
 
@@ -1294,7 +1294,16 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     if telegram_token:
         if Platform.TELEGRAM not in config.platforms:
             config.platforms[Platform.TELEGRAM] = PlatformConfig()
-        config.platforms[Platform.TELEGRAM].enabled = True
+            config.platforms[Platform.TELEGRAM].enabled = True
+        else:
+            telegram_config = config.platforms[Platform.TELEGRAM]
+            enabled_was_explicit = bool(telegram_config.extra.pop("_enabled_explicit", False))
+            if not telegram_config.enabled and not enabled_was_explicit:
+                # Top-level Telegram settings should not disable env-token setups;
+                # an explicit telegram.enabled/platforms.telegram.enabled false should.
+                telegram_config.enabled = True
+        # Keep token available for explicit outbound/fallback sends even when
+        # the gateway adapter is disabled by config.
         config.platforms[Platform.TELEGRAM].token = telegram_token
     
     # Reply threading mode for Telegram (off/first/all)
