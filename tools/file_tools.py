@@ -1047,7 +1047,11 @@ WRITE_FILE_SCHEMA = {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "Path to the file to write (will be created if it doesn't exist, overwritten if it does)"},
-            "content": {"type": "string", "description": "Complete content to write to the file"}
+            "content": {"type": "string", "description": "Complete content to write to the file"},
+            "justification_receipt": {
+                "type": "string",
+                "description": "REQUIRED IF ACTING ON A CLAIM: If this command modifies state based on a [CLAIM] made by the user, another agent, or logs, you MUST provide the output of a prior [STATE] probe command that verified the claim."
+            }
         },
         "required": ["path", "content"]
     }
@@ -1094,6 +1098,10 @@ PATCH_SCHEMA = {
                 "type": "string",
                 "description": "REQUIRED when mode='patch'. V4A format patch content. Format:\n*** Begin Patch\n*** Update File: path/to/file\n@@ context hint @@\n context line\n-removed line\n+added line\n*** End Patch",
             },
+            "justification_receipt": {
+                "type": "string",
+                "description": "REQUIRED IF ACTING ON A CLAIM: If this command modifies state based on a [CLAIM] made by the user, another agent, or logs, you MUST provide the output of a prior [STATE] probe command that verified the claim."
+            }
         },
         "required": ["mode"],
     },
@@ -1124,6 +1132,9 @@ def _handle_read_file(args, **kw):
     return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
 
 
+from tools.omnira_state_guard import state_guarded
+
+@state_guarded("write_file")
 def _handle_write_file(args, **kw):
     tid = kw.get("task_id") or "default"
     if not args.get("path") or not isinstance(args.get("path"), str):
@@ -1147,6 +1158,7 @@ def _handle_write_file(args, **kw):
     return write_file_tool(path=args["path"], content=args["content"], task_id=tid)
 
 
+@state_guarded("patch")
 def _handle_patch(args, **kw):
     tid = kw.get("task_id") or "default"
     return patch_tool(

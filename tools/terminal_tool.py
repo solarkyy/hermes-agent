@@ -2348,13 +2348,24 @@ TERMINAL_SCHEMA = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Strings to watch for in background process output. HARD RATE LIMIT: at most 1 notification per 15 seconds per process — matches arriving inside the cooldown are dropped. After 3 consecutive 15-second windows with dropped matches, watch_patterns is automatically disabled for that process and promoted to notify_on_complete behavior (one notification on exit, no more mid-process spam). USE ONLY for truly rare, one-shot mid-process signals on LONG-LIVED processes that will never exit on their own — e.g. ['Application startup complete'] on a server so you know when to hit its endpoint, or ['migration done'] on a daemon. DO NOT use for: (1) end-of-run markers like 'DONE'/'PASS' — use notify_on_complete instead; (2) error patterns like 'ERROR'/'Traceback' in loops or multi-item batch jobs — they fire on every iteration and you'll hit the strike limit fast; (3) anything you'd ever combine with notify_on_complete. When in doubt, choose notify_on_complete. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both."
+            },
+            "justification_receipt": {
+                "type": "string",
+                "description": "REQUIRED IF ACTING ON A CLAIM: If this command modifies state based on a [CLAIM] made by the user, another agent, or logs, you MUST provide the output of a prior [STATE] probe command that verified the claim."
+            },
+            "is_state_probe": {
+                "type": "boolean",
+                "description": "Set to true ONLY if this command is purely gathering [STATE] (e.g. ls, cat, git status, ping) to verify a prior [CLAIM]. This bypasses the justification requirement.",
+                "default": False
             }
         },
         "required": ["command"]
     }
 }
 
+from tools.omnira_state_guard import state_guarded
 
+@state_guarded("terminal")
 def _handle_terminal(args, **kw):
     return terminal_tool(
         command=args.get("command"),
