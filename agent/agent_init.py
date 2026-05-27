@@ -50,6 +50,7 @@ from agent.tool_guardrails import (
 from hermes_cli.config import cfg_get
 from hermes_cli.timeouts import get_provider_request_timeout
 from hermes_constants import get_hermes_home
+from toolsets import resolve_multiple_toolsets
 from utils import base_url_host_matches
 
 # Use the same logger name as run_agent so tests patching ``run_agent.logger``
@@ -1470,15 +1471,30 @@ def init_agent(
     agent.compression_enabled = compression_enabled
 
     # Reject models whose context window is below the minimum required
-    # for reliable tool-calling workflows (64K tokens).
+    # for reliable tool-calling workflows (64K tokens). Explicit no-tool
+    # sessions (enabled_toolsets=[] or toolsets that resolve to no tools, e.g.
+    # `none`) are allowed to use smaller local chat-only models such as
+    # llama-server deployments with 32K context.
     _ctx = getattr(agent.context_compressor, "context_length", 0)
-    if _ctx and _ctx < MINIMUM_CONTEXT_LENGTH:
+    _tool_surface_requested = True
+    if enabled_toolsets is not None:
+        try:
+            _tool_surface_requested = bool(resolve_multiple_toolsets(enabled_toolsets))
+        except Exception:
+            _tool_surface_requested = True
+    if _ctx and _ctx < MINIMUM_CONTEXT_LENGTH and _tool_surface_requested:
         raise ValueError(
             f"Model {agent.model} has a context window of {_ctx:,} tokens, "
             f"which is below the minimum {MINIMUM_CONTEXT_LENGTH:,} required "
             f"by Hermes Agent.  Choose a model with at least "
             f"{MINIMUM_CONTEXT_LENGTH // 1000}K context, or set "
             f"model.context_length in config.yaml to override."
+        )
+    if _ctx and _ctx < MINIMUM_CONTEXT_LENGTH and not _tool_surface_requested:
+        _ra().logger.info(
+            "Allowing small-context chat-only model with no tools: model=%s context=%d",
+            agent.model,
+            _ctx,
         )
 
     # Inject context engine tool schemas (e.g. lcm_grep, lcm_describe, lcm_expand).
