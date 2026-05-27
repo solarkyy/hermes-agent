@@ -1399,6 +1399,10 @@ WRITE_FILE_SCHEMA = {
                 "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories — by default these writes are blocked with a warning because they affect a different profile than the one this session is running under.",
                 "default": False,
             },
+            "justification_receipt": {
+                "type": "string",
+                "description": "REQUIRED IF ACTING ON A CLAIM: If this command modifies state based on a [CLAIM] made by the user, another agent, or logs, you MUST provide the output of a prior [STATE] probe command that verified the claim."
+            },
         },
         "required": ["path", "content"]
     }
@@ -1450,6 +1454,10 @@ PATCH_SCHEMA = {
                 "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories.",
                 "default": False,
             },
+            "justification_receipt": {
+                "type": "string",
+                "description": "REQUIRED IF ACTING ON A CLAIM: If this command modifies state based on a [CLAIM] made by the user, another agent, or logs, you MUST provide the output of a prior [STATE] probe command that verified the claim."
+            },
         },
         "required": ["mode"],
     },
@@ -1480,6 +1488,9 @@ def _handle_read_file(args, **kw):
     return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
 
 
+from tools.omnira_state_guard import state_guarded
+
+@state_guarded("write_file")
 def _handle_write_file(args, **kw):
     tid = kw.get("task_id") or "default"
     if not args.get("path") or not isinstance(args.get("path"), str):
@@ -1506,6 +1517,7 @@ def _handle_write_file(args, **kw):
     )
 
 
+@state_guarded("patch")
 def _handle_patch(args, **kw):
     tid = kw.get("task_id") or "default"
     return patch_tool(
