@@ -317,6 +317,62 @@ def _detect_claude_code_version() -> str:
 
 _CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
 _MCP_TOOL_PREFIX = "mcp_"
+# Claude subscription OAuth routes large third-party system prompts to the
+# paid "extra usage" bucket. Keep the non-Claude-Code system payload compact by
+# default; set HERMES_ANTHROPIC_OAUTH_SYSTEM_CHAR_LIMIT=0 to disable.
+_OAUTH_SYSTEM_CHAR_LIMIT_DEFAULT = 6000
+# Claude Code prefixes its MCP server tools with ``mcp__``. Hermes historically
+# blanket-prefixed EVERY OAuth tool with ``mcp_``, but Anthropic's subscription
+# OAuth surface routes any ``mcp_*``-named tool to the paid "extra usage"
+# bucket (verified by replay: identical payload with the prefix => HTTP 400
+# "out of extra usage"; without it => normal plan route). pi-ai/Claude Code
+# never prefix arbitrary tools, so default OFF. Set
+# HERMES_ANTHROPIC_OAUTH_MCP_PREFIX=1 to restore the legacy prefixing.
+_OAUTH_MCP_PREFIX_DEFAULT = False
+
+
+def oauth_mcp_prefix_enabled() -> bool:
+    raw = os.getenv("HERMES_ANTHROPIC_OAUTH_MCP_PREFIX", "").strip().lower()
+    if not raw:
+        return _OAUTH_MCP_PREFIX_DEFAULT
+    return raw in ("1", "true", "yes", "on")
+
+
+def _oauth_system_char_limit() -> int:
+    raw = os.getenv("HERMES_ANTHROPIC_OAUTH_SYSTEM_CHAR_LIMIT", "").strip()
+    if not raw:
+        return _OAUTH_SYSTEM_CHAR_LIMIT_DEFAULT
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _OAUTH_SYSTEM_CHAR_LIMIT_DEFAULT
+
+
+def _compact_oauth_system_prompt(system):
+    """Keep Claude subscription OAuth system prompts below extra-usage routing."""
+    limit = _oauth_system_char_limit()
+    if not limit or not isinstance(system, list):
+        return system
+
+    remaining = limit
+    compacted = []
+    for index, block in enumerate(system):
+        if not isinstance(block, dict) or block.get("type") != "text":
+            compacted.append(block)
+            continue
+        text = str(block.get("text", ""))
+        if index == 0 and text == _CLAUDE_CODE_SYSTEM_PREFIX:
+            compacted.append(block)
+            continue
+        if len(text) <= remaining:
+            compacted.append(block)
+            remaining -= len(text)
+            continue
+        new_block = dict(block)
+        new_block["text"] = text[: max(0, remaining)] + "\n\n[System prompt compacted for Claude subscription OAuth plan limits.]"
+        compacted.append(new_block)
+        return compacted
+    return system
 
 
 def _get_claude_code_version() -> str:
@@ -749,8 +805,14 @@ def build_anthropic_client(
         kwargs["auth_token"] = api_key
         kwargs["default_headers"] = {
             "anthropic-beta": ",".join(all_betas),
-            "user-agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
+            # Match Claude Code / pi-ai's subscription-OAuth fingerprint as
+            # closely as possible. The "external" user-agent variant can be
+            # routed as third-party harness usage by Anthropic and hit the
+            # paid "extra usage" bucket instead of ordinary Claude plan limits.
+            "user-agent": f"claude-cli/{_get_claude_code_version()}",
             "x-app": "cli",
+            "anthropic-client-platform": "claude_code_cli",
+            "anthropic-dangerous-direct-browser-access": "true",
         }
     else:
         # Regular API key → x-api-key header + common betas
@@ -2148,27 +2210,36 @@ def build_anthropic_kwargs(
                 text = text.replace("Nous Research", "Anthropic")
                 block["text"] = text
 
-        # 3. Prefix tool names with mcp_ (Claude Code convention)
-        #    Skip names that already begin with the marker — native MCP server
-        #    tools (from mcp_servers: in config.yaml) are registered under their
-        #    full mcp_<server>_<tool> name and would double-prefix otherwise,
-        #    breaking round-trip registry lookup in normalize_response. GH-25255.
-        if anthropic_tools:
-            for tool in anthropic_tools:
-                if "name" in tool and not tool["name"].startswith(_MCP_TOOL_PREFIX):
-                    tool["name"] = _MCP_TOOL_PREFIX + tool["name"]
+        system = _compact_oauth_system_prompt(system)
 
-        # 4. Prefix tool names in message history (tool_use and tool_result blocks)
-        for msg in anthropic_messages:
-            content = msg.get("content")
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict):
-                        if block.get("type") == "tool_use" and "name" in block:
-                            if not block["name"].startswith(_MCP_TOOL_PREFIX):
-                                block["name"] = _MCP_TOOL_PREFIX + block["name"]
-                        elif block.get("type") == "tool_result" and "tool_use_id" in block:
-                            pass  # tool_result uses ID, not name
+        # 3. Optionally prefix tool names with mcp_ (legacy Claude Code
+        #    convention). Anthropic's subscription OAuth surface bills any
+        #    mcp_*-named tool against the paid extra-usage bucket, so this is
+        #    OFF by default and gated behind oauth_mcp_prefix_enabled(). The
+        #    response path strips the same prefix only when this is enabled,
+        #    keeping the round-trip symmetric.
+        if oauth_mcp_prefix_enabled():
+            #    Skip names that already begin with the marker — native MCP
+            #    server tools (from mcp_servers: in config.yaml) are registered
+            #    under their full mcp_<server>_<tool> name and would
+            #    double-prefix otherwise, breaking round-trip registry lookup
+            #    in normalize_response. GH-25255.
+            if anthropic_tools:
+                for tool in anthropic_tools:
+                    if "name" in tool and not tool["name"].startswith(_MCP_TOOL_PREFIX):
+                        tool["name"] = _MCP_TOOL_PREFIX + tool["name"]
+
+            # 4. Prefix tool names in message history (tool_use blocks)
+            for msg in anthropic_messages:
+                content = msg.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict):
+                            if block.get("type") == "tool_use" and "name" in block:
+                                if not block["name"].startswith(_MCP_TOOL_PREFIX):
+                                    block["name"] = _MCP_TOOL_PREFIX + block["name"]
+                            elif block.get("type") == "tool_result" and "tool_use_id" in block:
+                                pass  # tool_result uses ID, not name
 
     kwargs: Dict[str, Any] = {
         "model": model,
@@ -2270,6 +2341,14 @@ def build_anthropic_kwargs(
         if is_oauth:
             betas.extend(_OAUTH_ONLY_BETAS)
         betas.append(_FAST_MODE_BETA)
-        kwargs["extra_headers"] = {"anthropic-beta": ",".join(betas)}
+        kwargs["extra_headers"] = {
+            "anthropic-beta": ",".join(betas),
+            **({
+                "user-agent": f"claude-cli/{_get_claude_code_version()}",
+                "x-app": "cli",
+                "anthropic-client-platform": "claude_code_cli",
+                "anthropic-dangerous-direct-browser-access": "true",
+            } if is_oauth else {}),
+        }
 
     return kwargs

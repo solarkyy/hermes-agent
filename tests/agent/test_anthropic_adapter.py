@@ -72,6 +72,12 @@ class TestBuildAnthropicClient:
             # Native Anthropic does not get context-1m by default; accounts
             # without that beta reject even short auxiliary requests.
             assert "context-1m-2025-08-07" not in betas
+            headers = kwargs["default_headers"]
+            assert headers["user-agent"].startswith("claude-cli/")
+            assert "external" not in headers["user-agent"]
+            assert headers["x-app"] == "cli"
+            assert headers["anthropic-client-platform"] == "claude_code_cli"
+            assert headers["anthropic-dangerous-direct-browser-access"] == "true"
             assert "api_key" not in kwargs
 
     def test_oauth_drop_context_1m_beta_strips_only_1m(self):
@@ -1080,6 +1086,10 @@ class TestBuildAnthropicKwargs:
         assert "fast-mode-2026-02-01" in betas
         assert "oauth-2025-04-20" in betas
         assert "context-1m-2025-08-07" not in betas
+        headers = kwargs["extra_headers"]
+        assert headers["user-agent"].startswith("claude-cli/")
+        assert "external" not in headers["user-agent"]
+        assert headers["anthropic-client-platform"] == "claude_code_cli"
 
     def test_fast_mode_oauth_drop_context_1m_beta_strips_only_1m(self):
         """drop_context_1m_beta=True strips context-1m from fast-mode
@@ -1100,6 +1110,61 @@ class TestBuildAnthropicKwargs:
         assert "oauth-2025-04-20" in betas
         assert "claude-code-20250219" in betas
         assert "interleaved-thinking-2025-05-14" in betas
+
+    def test_oauth_does_not_mcp_prefix_tools_by_default(self):
+        tools = [
+            {"type": "function", "function": {
+                "name": "execute_code",
+                "description": "d",
+                "parameters": {"type": "object", "properties": {}},
+            }}
+        ]
+        kwargs = build_anthropic_kwargs(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=tools,
+            max_tokens=4096,
+            reasoning_config=None,
+            is_oauth=True,
+        )
+        assert [t["name"] for t in kwargs["tools"]] == ["execute_code"]
+
+    def test_oauth_mcp_prefix_opt_in_via_env(self, monkeypatch):
+        monkeypatch.setenv("HERMES_ANTHROPIC_OAUTH_MCP_PREFIX", "1")
+        tools = [
+            {"type": "function", "function": {
+                "name": "execute_code",
+                "description": "d",
+                "parameters": {"type": "object", "properties": {}},
+            }}
+        ]
+        kwargs = build_anthropic_kwargs(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=tools,
+            max_tokens=4096,
+            reasoning_config=None,
+            is_oauth=True,
+        )
+        assert [t["name"] for t in kwargs["tools"]] == ["mcp_execute_code"]
+
+    def test_oauth_compacts_large_system_prompt_for_subscription_limits(self):
+        kwargs = build_anthropic_kwargs(
+            model="claude-opus-4-8",
+            messages=[
+                {"role": "system", "content": "A" * 20_000},
+                {"role": "user", "content": "Hi"},
+            ],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config=None,
+            is_oauth=True,
+        )
+
+        system = kwargs["system"]
+        assert system[0]["text"] == "You are Claude Code, Anthropic's official CLI for Claude."
+        assert len(system[1]["text"]) < 7_000
+        assert "compacted for Claude subscription OAuth" in system[1]["text"]
 
     def test_reasoning_config_maps_to_manual_thinking_for_pre_4_6_models(self):
         kwargs = build_anthropic_kwargs(
