@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import struct
 import subprocess
+import wave
 from pathlib import Path
 
 import pytest
@@ -64,6 +66,34 @@ class TestPwRecordBackend:
             "--sample-count",
         ]
         assert seen["cmd"][8] == str(int(16000 * 1.25))
+
+    def test_pw_record_backend_accepts_explicit_target(self, monkeypatch, tmp_path):
+        from tools.voice_to_stdin import _record_with_pw_record
+
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            Path(cmd[-1]).write_bytes(b"wav-bytes")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr("tools.voice_to_stdin.shutil.which", lambda name: "/usr/bin/pw-record" if name == "pw-record" else None)
+        monkeypatch.setattr("tools.voice_to_stdin.tempfile.gettempdir", lambda: str(tmp_path))
+        monkeypatch.setattr("tools.voice_to_stdin.subprocess.run", fake_run)
+
+        wav_path = _record_with_pw_record(duration=1.0, quiet=True, target="alsa_input.usb-FOX.mono-fallback")
+
+        assert Path(wav_path).read_bytes() == b"wav-bytes"
+        assert seen["cmd"][:3] == ["/usr/bin/pw-record", "--target", "alsa_input.usb-FOX.mono-fallback"]
+        assert "--sample-count" in seen["cmd"]
+
+
+def _write_wav(path: Path, samples: list[int]) -> None:
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(struct.pack("<" + "h" * len(samples), *samples))
 
 
 class TestRecordAndTranscribeOnce:
@@ -147,6 +177,49 @@ class TestRecordAndTranscribeOnce:
 
         with pytest.raises(VoiceInputError, match="backend must be"):
             record_and_transcribe_once(backend="bad", require_ready=False, quiet=True)
+
+    def test_audio_gate_rejects_low_level_audio_before_transcription(self, tmp_path):
+        from tools.voice_to_stdin import VoiceInputError, record_and_transcribe_once
+
+        wav_path = tmp_path / "quiet.wav"
+        _write_wav(wav_path, [5, -5] * 100)
+
+        called = False
+
+        def transcriber(path, model=None):
+            nonlocal called
+            called = True
+            return {"success": True, "transcript": "1.8g 1.8g"}
+
+        with pytest.raises(VoiceInputError, match="audio below voice threshold"):
+            record_and_transcribe_once(
+                recorder_factory=lambda: FakeRecorder(str(wav_path)),
+                transcriber=transcriber,
+                require_ready=False,
+                quiet=True,
+                min_rms=80,
+                min_peak=300,
+            )
+        assert called is False
+
+    def test_audio_gate_allows_speech_level_audio(self, tmp_path):
+        from tools.voice_to_stdin import record_and_transcribe_once
+
+        wav_path = tmp_path / "speech.wav"
+        _write_wav(wav_path, [0, 1200, -1200, 600, -600] * 100)
+
+        result = record_and_transcribe_once(
+            recorder_factory=lambda: FakeRecorder(str(wav_path)),
+            transcriber=lambda path, model=None: {"success": True, "transcript": "real speech"},
+            require_ready=False,
+            quiet=True,
+            min_rms=80,
+            min_peak=300,
+        )
+
+        assert result["transcript"] == "real speech"
+        assert result["audio_gate"]["rms"] >= 80
+        assert result["audio_gate"]["peak"] >= 300
 
 
 class TestVoiceToStdinCLI:

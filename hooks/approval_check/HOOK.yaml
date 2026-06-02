@@ -1,0 +1,5 @@
+name: approval_check
+description: Check approvals endpoint before processing builds or agent tasks
+events:
+  - agent:start
+  - command:build

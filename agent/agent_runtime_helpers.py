@@ -1064,8 +1064,25 @@ def dump_api_request_debug(
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         dump_file = agent.logs_dir / f"request_dump_{agent.session_id}_{timestamp}.json"
+        dump_text = json.dumps(dump_payload, ensure_ascii=False, indent=2, default=str)
+        try:
+            from agent.redact import redact_sensitive_text
+            import re as _re
+
+            dump_text = redact_sensitive_text(dump_text, force=True)
+            # OAuth authorization codes pasted into prompts often appear as
+            # opaque ``code#state`` fragments, with no provider prefix for the
+            # generic redactor to key on. Request dumps are diagnostics, not
+            # transcripts, so redact that shape aggressively.
+            dump_text = _re.sub(
+                r"\b[A-Za-z0-9_-]{32,}#[A-Za-z0-9_-]{20,}\b",
+                "[REDACTED_OAUTH_CODE]",
+                dump_text,
+            )
+        except Exception:
+            pass
         dump_file.write_text(
-            json.dumps(dump_payload, ensure_ascii=False, indent=2, default=str),
+            dump_text,
             encoding="utf-8",
         )
 

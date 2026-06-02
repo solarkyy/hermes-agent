@@ -97,6 +97,20 @@ def test_goal_status_alias_shows_status(server, session):
     assert "No active goal" in r["result"]["output"]
 
 
+def test_loop_alias_bare_shows_status_when_none_set(server, session):
+    sid, _, _ = session
+    r = _call(server, "command.dispatch", name="loop", arg="", session_id=sid)
+    assert r["result"]["type"] == "exec"
+    assert "No active goal" in r["result"]["output"]
+
+
+def test_loop_alias_status_shows_status(server, session):
+    sid, _, _ = session
+    r = _call(server, "command.dispatch", name="loop", arg="status", session_id=sid)
+    assert r["result"]["type"] == "exec"
+    assert "No active goal" in r["result"]["output"]
+
+
 def test_goal_set_returns_send_with_notice(server, session):
     sid, session_key, _ = session
     r = _call(server, "command.dispatch", name="goal", arg="build a rocket", session_id=sid)
@@ -116,10 +130,40 @@ def test_goal_set_returns_send_with_notice(server, session):
     assert mgr.state.status == "active"
 
 
+def test_loop_set_returns_send_with_notice(server, session):
+    sid, session_key, _ = session
+    r = _call(server, "command.dispatch", name="loop", arg="compile the report", session_id=sid)
+    result = r["result"]
+    assert result["type"] == "send"
+    assert result["message"] == "compile the report"
+    assert "notice" in result
+    assert "Goal set" in result["notice"]
+    assert "20-turn budget" in result["notice"]
+
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager(session_key)
+    assert mgr.state is not None
+    assert mgr.state.goal == "compile the report"
+    assert mgr.state.status == "active"
+
+
 def test_goal_pause_after_set(server, session):
     sid, session_key, _ = session
     _call(server, "command.dispatch", name="goal", arg="write a story", session_id=sid)
     r = _call(server, "command.dispatch", name="goal", arg="pause", session_id=sid)
+    assert r["result"]["type"] == "exec"
+    assert "paused" in r["result"]["output"].lower()
+
+    from hermes_cli.goals import GoalManager
+
+    assert GoalManager(session_key).state.status == "paused"
+
+
+def test_loop_pause_after_set(server, session):
+    sid, session_key, _ = session
+    _call(server, "command.dispatch", name="loop", arg="write a story", session_id=sid)
+    r = _call(server, "command.dispatch", name="loop", arg="pause", session_id=sid)
     assert r["result"]["type"] == "exec"
     assert "paused" in r["result"]["output"].lower()
 
@@ -190,7 +234,16 @@ def test_slash_exec_rejects_goal_routes_to_command_dispatch(server, session):
     assert "command.dispatch" in r["error"]["message"]
 
 
+def test_slash_exec_rejects_loop_routes_to_command_dispatch(server, session):
+    sid, _, _ = session
+    r = _call(server, "slash.exec", command="loop status", session_id=sid)
+    assert "error" in r
+    assert r["error"]["code"] == 4018
+    assert "command.dispatch" in r["error"]["message"]
+
+
 def test_pending_input_commands_includes_goal(server):
     """Guard: _PENDING_INPUT_COMMANDS must list 'goal' — removing it would
     silently re-break the TUI."""
     assert "goal" in server._PENDING_INPUT_COMMANDS
+    assert "loop" in server._PENDING_INPUT_COMMANDS

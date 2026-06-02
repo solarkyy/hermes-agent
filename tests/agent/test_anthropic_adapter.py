@@ -1082,6 +1082,48 @@ class TestBuildAnthropicKwargs:
         assert "claude-code-20250219" in betas
         assert "interleaved-thinking-2025-05-14" in betas
 
+    def test_oauth_does_not_mcp_prefix_tools_by_default(self):
+        """mcp_*-named tools route to paid extra usage on Claude OAuth.
+
+        Default must leave tool names untouched so subscription OAuth stays on
+        plan allowance.
+        """
+        tools = [
+            {"type": "function", "function": {
+                "name": "execute_code",
+                "description": "d",
+                "parameters": {"type": "object", "properties": {}},
+            }}
+        ]
+        kwargs = build_anthropic_kwargs(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=tools,
+            max_tokens=4096,
+            reasoning_config=None,
+            is_oauth=True,
+        )
+        assert [t["name"] for t in kwargs["tools"]] == ["execute_code"]
+
+    def test_oauth_mcp_prefix_opt_in_via_env(self, monkeypatch):
+        monkeypatch.setenv("HERMES_ANTHROPIC_OAUTH_MCP_PREFIX", "1")
+        tools = [
+            {"type": "function", "function": {
+                "name": "execute_code",
+                "description": "d",
+                "parameters": {"type": "object", "properties": {}},
+            }}
+        ]
+        kwargs = build_anthropic_kwargs(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=tools,
+            max_tokens=4096,
+            reasoning_config=None,
+            is_oauth=True,
+        )
+        assert [t["name"] for t in kwargs["tools"]] == ["mcp_execute_code"]
+
     def test_reasoning_config_maps_to_manual_thinking_for_pre_4_6_models(self):
         kwargs = build_anthropic_kwargs(
             model="claude-sonnet-4-20250514",

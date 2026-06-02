@@ -358,6 +358,18 @@ def test_goal_command_dispatches_in_cli_registry_helpers():
     assert "/goal" in session_cmds
 
 
+def test_loop_alias_dispatches_to_goal():
+    from hermes_cli.commands import resolve_command, COMMANDS, COMMANDS_BY_CATEGORY
+
+    cmd = resolve_command("loop")
+    assert cmd is not None
+    assert cmd.name == "goal"
+
+    assert "/loop" in COMMANDS
+    session_cmds = COMMANDS_BY_CATEGORY.get("Session", {})
+    assert "/loop" in session_cmds
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Auto-pause on consecutive judge parse failures
 # ──────────────────────────────────────────────────────────────────────

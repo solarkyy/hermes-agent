@@ -24,6 +24,8 @@ _PROVIDER_ALIASES = {
     "claude-code": "anthropic",
     "anthropic": "anthropic",
     "codex": "openai-codex",
+    "chatgpt": "openai-codex",
+    "gpt": "openai-codex",
     "openai": "openai-codex",
     "openai-codex": "openai-codex",
     "github": "copilot",

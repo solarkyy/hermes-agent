@@ -87,7 +87,15 @@ class AnthropicTransport(ProviderTransport):
         from agent.anthropic_adapter import _to_plain_data
         from agent.transports.types import ToolCall
 
-        strip_tool_prefix = kwargs.get("strip_tool_prefix", False)
+        # Only strip the mcp_ prefix when the request side actually applied it.
+        # The request prefixing is gated (and OFF by default) because Anthropic
+        # OAuth routes mcp_*-named tools to paid extra usage; the response strip
+        # must follow the same switch or it would mangle tools legitimately
+        # named mcp_* (e.g. real MCP servers).
+        from agent.anthropic_adapter import oauth_mcp_prefix_enabled
+        strip_tool_prefix = (
+            kwargs.get("strip_tool_prefix", False) and oauth_mcp_prefix_enabled()
+        )
         _MCP_PREFIX = "mcp_"
 
         text_parts = []
