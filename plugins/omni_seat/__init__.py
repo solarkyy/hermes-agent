@@ -200,16 +200,16 @@ def _session_needs_discord_boot(event: Any, gateway: Any, session_store: Any) ->
         else:
             return True
     except Exception as exc:
-        logger.debug("omni-seat: could not resolve session key: %s", exc)
-        return False
+        logger.warning("omni-seat: could not resolve session key; injecting Discord boot defensively: %s", exc)
+        return True
 
     try:
         if hasattr(session_store, "_ensure_loaded"):
             session_store._ensure_loaded()
         entry = getattr(session_store, "_entries", {}).get(session_key)
     except Exception as exc:
-        logger.debug("omni-seat: could not inspect session store: %s", exc)
-        return False
+        logger.warning("omni-seat: could not inspect session store; injecting Discord boot defensively: %s", exc)
+        return True
 
     if entry is None:
         return True
@@ -226,8 +226,8 @@ def _session_needs_discord_boot(event: Any, gateway: Any, session_store: Any) ->
     try:
         history = session_store.load_transcript(entry.session_id)
     except Exception as exc:
-        logger.debug("omni-seat: could not inspect transcript for %s: %s", session_key, exc)
-        return False
+        logger.warning("omni-seat: could not inspect transcript for %s; injecting Discord boot defensively: %s", session_key, exc)
+        return True
     return not _history_has_boot_marker(history)
 
 
@@ -293,3 +293,4 @@ def register(ctx):
     """Register the omni-seat plugin with Hermes."""
     ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("pre_gateway_dispatch", _on_pre_gateway_dispatch)
+    logger.info("omni-seat: registered on_session_start + pre_gateway_dispatch hooks")

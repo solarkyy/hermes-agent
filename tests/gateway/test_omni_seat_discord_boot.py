@@ -8,10 +8,11 @@ from plugins.omni_seat import (
 
 
 class FakeSessionStore:
-    def __init__(self, *, entry=None, history=None, reset=False):
+    def __init__(self, *, entry=None, history=None, reset=False, load_error=None):
         self._entries = {}
         self.history = history or []
         self.reset = reset
+        self.load_error = load_error
         if entry is not None:
             self._entries["session-key"] = entry
 
@@ -25,6 +26,8 @@ class FakeSessionStore:
         return "idle" if self.reset else None
 
     def load_transcript(self, session_id):
+        if self.load_error:
+            raise self.load_error
         return self.history
 
 
@@ -126,6 +129,19 @@ def test_pre_gateway_dispatch_does_not_repeat_when_transcript_has_marker(monkeyp
     result = _on_pre_gateway_dispatch(event=_event("continue"), session_store=store)
 
     assert result is None
+
+
+def test_pre_gateway_dispatch_injects_when_existing_transcript_cannot_be_read(monkeypatch, tmp_path):
+    _write_boot_files(tmp_path)
+    monkeypatch.setenv("OMNIOS_ROOT", str(tmp_path))
+    entry = SimpleNamespace(session_id="sid", suspended=False)
+    store = FakeSessionStore(entry=entry, load_error=RuntimeError("db unavailable"))
+
+    result = _on_pre_gateway_dispatch(event=_event("where are we?"), session_store=store)
+
+    assert result["action"] == "rewrite"
+    assert _BOOT_MARKER in result["text"]
+    assert "[User message]\nwhere are we?" in result["text"]
 
 
 def test_pre_gateway_dispatch_ignores_non_discord(monkeypatch, tmp_path):
