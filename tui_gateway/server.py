@@ -5838,6 +5838,7 @@ _PENDING_INPUT_COMMANDS: frozenset[str] = frozenset(
         "steer",
         "plan",
         "goal",
+        "loop",
         "undo",
     }
 )
@@ -6153,7 +6154,7 @@ def _(rid, params: dict) -> dict:
         # Fallback: no active run, treat as next-turn message
         return _ok(rid, {"type": "send", "message": arg})
 
-    if name == "goal":
+    if name in {"goal", "loop"}:
         if not session:
             return _err(rid, 4001, "no active session")
         try:

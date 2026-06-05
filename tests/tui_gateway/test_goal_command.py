@@ -122,6 +122,15 @@ def test_goal_set_returns_send_with_notice(server, session):
     assert mgr.state.status == "active"
 
 
+def test_loop_alias_set_returns_send_with_notice(server, session):
+    sid, _, _ = session
+    r = _call(server, "command.dispatch", name="loop", arg="build a rocket", session_id=sid)
+    result = r["result"]
+    assert result["type"] == "send"
+    assert result["message"] == "build a rocket"
+    assert "Goal set" in result["notice"]
+
+
 def test_goal_pause_after_set(server, session):
     sid, session_key, _ = session
     _call(server, "command.dispatch", name="goal", arg="write a story", session_id=sid)
@@ -197,6 +206,7 @@ def test_slash_exec_rejects_goal_routes_to_command_dispatch(server, session):
 
 
 def test_pending_input_commands_includes_goal(server):
-    """Guard: _PENDING_INPUT_COMMANDS must list 'goal' — removing it would
+    """Guard: _PENDING_INPUT_COMMANDS must list 'goal'/'loop' — removing either would
     silently re-break the TUI."""
     assert "goal" in server._PENDING_INPUT_COMMANDS
+    assert "loop" in server._PENDING_INPUT_COMMANDS
