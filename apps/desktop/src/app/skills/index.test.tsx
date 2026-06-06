@@ -21,10 +21,15 @@ vi.mock('@/hermes', () => ({
   setEnvVar: vi.fn()
 }))
 
-// Notifications hit nanostores/timers we don't care about here.
 vi.mock('@/store/notifications', () => ({
   notify: vi.fn(),
   notifyError: vi.fn()
+}))
+
+vi.mock('../gateway/hooks/use-gateway-request', () => ({
+  useGatewayRequest: () => ({
+    requestGateway: vi.fn().mockResolvedValue({ toolsets: [{ name: 'web', enabled: true }] })
+  })
 }))
 
 function toolset(overrides: Record<string, unknown> = {}) {
@@ -81,7 +86,7 @@ describe('SkillsView toolset management', () => {
 
     await renderSkills()
 
-    expect(screen.getByText('Cron Jobs')).toBeTruthy()
+    expect(await screen.findByText('Cron Jobs')).toBeTruthy()
     expect(screen.queryByText(/⏰/)).toBeNull()
   })
 
@@ -90,6 +95,16 @@ describe('SkillsView toolset management', () => {
 
     await screen.findByRole('switch', { name: 'Toggle Web Search toolset' })
     expect(screen.getByText('Configured')).toBeTruthy()
+    expect(screen.getByText('Runtime OK')).toBeTruthy()
+  })
+
+  it('shows unavailable runtime when check_fn requirements are not met', async () => {
+    getToolsets.mockResolvedValue([toolset({ available: false, agent_ready: false })])
+
+    await renderSkills()
+
+    expect(await screen.findByText('Unavailable')).toBeTruthy()
+    expect(screen.getByText('Enabled, not ready')).toBeTruthy()
   })
 
   it('expands the provider config panel when the configured pill is clicked', async () => {

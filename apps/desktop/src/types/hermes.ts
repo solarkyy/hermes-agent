@@ -483,6 +483,8 @@ export interface SkillInfo {
 }
 
 export interface ToolsetInfo {
+  agent_ready?: boolean
+  available: boolean
   configured: boolean
   description: string
   enabled: boolean

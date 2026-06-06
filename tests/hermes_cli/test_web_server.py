@@ -2128,6 +2128,11 @@ class TestNewEndpoints:
                 "memory": ["memory_read"],
             }[name],
         )
+        monkeypatch.setattr(
+            web_server,
+            "_runtime_toolset_availability",
+            lambda: {"web": False, "skills": True, "memory": True},
+        )
         monkeypatch.setattr(web_server, "load_config", lambda: {"platform_toolsets": {"cli": ["web", "skills"]}})
 
         resp = self.client.get("/api/tools/toolsets")
@@ -2139,7 +2144,8 @@ class TestNewEndpoints:
                 "label": "Web Search & Scraping",
                 "description": "web_search, web_extract",
                 "enabled": True,
-                "available": True,
+                "available": False,
+                "agent_ready": False,
                 "configured": False,
                 "tools": ["web_extract", "web_search"],
             },
@@ -2149,6 +2155,7 @@ class TestNewEndpoints:
                 "description": "list, view, manage",
                 "enabled": True,
                 "available": True,
+                "agent_ready": True,
                 "configured": True,
                 "tools": ["skill_view", "skills_list"],
             },
@@ -2157,7 +2164,8 @@ class TestNewEndpoints:
                 "label": "Memory",
                 "description": "persistent memory across sessions",
                 "enabled": False,
-                "available": False,
+                "available": True,
+                "agent_ready": False,
                 "configured": True,
                 "tools": ["memory_read"],
             },

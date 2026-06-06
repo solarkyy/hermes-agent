@@ -2386,6 +2386,7 @@ async def get_env_vars():
 async def set_env_var(body: EnvVarUpdate):
     try:
         save_env_value(body.key, body.value)
+        _invalidate_tool_availability_cache()
         return {"ok": True, "key": body.key}
     except ValueError as exc:
         # save_env_value raises ValueError for invalid names and for keys
@@ -2501,6 +2502,7 @@ async def remove_env_var(body: EnvVarDelete):
         removed = remove_env_value(body.key)
         if not removed:
             raise HTTPException(status_code=404, detail=f"{body.key} not found in .env")
+        _invalidate_tool_availability_cache()
         return {"ok": True, "key": body.key}
     except HTTPException:
         raise
@@ -7182,6 +7184,21 @@ async def toggle_skill(body: SkillToggle):
     return {"ok": True, "name": body.name, "enabled": body.enabled}
 
 
+def _runtime_toolset_availability() -> dict[str, bool]:
+    """Return ``{toolset: requirements_met}`` from registry ``check_fn`` results."""
+    import model_tools  # noqa: F401 — trigger tool discovery before registry queries
+
+    from tools.registry import registry
+
+    return registry.check_toolset_requirements()
+
+
+def _invalidate_tool_availability_cache() -> None:
+    from tools.registry import invalidate_check_fn_cache
+
+    invalidate_check_fn_cache()
+
+
 @app.get("/api/tools/toolsets")
 async def get_toolsets():
     from hermes_cli.tools_config import (
@@ -7198,6 +7215,7 @@ async def get_toolsets():
         "cli",
         include_default_mcp_servers=False,
     )
+    runtime = _runtime_toolset_availability()
     result = []
     for name, label, desc in _get_effective_configurable_toolsets():
         try:
@@ -7205,12 +7223,14 @@ async def get_toolsets():
         except Exception:
             tools = []
         is_enabled = name in enabled_toolsets
+        is_runtime = runtime.get(name, False)
         result.append({
             "name": name,
             "label": gui_toolset_label(label),
             "description": desc,
             "enabled": is_enabled,
-            "available": is_enabled,
+            "available": is_runtime,
+            "agent_ready": is_enabled and is_runtime,
             "configured": _toolset_has_keys(name, config),
             "tools": tools,
         })
@@ -7248,6 +7268,7 @@ async def toggle_toolset(name: str, body: ToolsetToggle):
     else:
         enabled.discard(name)
     _save_platform_tools(config, "cli", enabled)
+    _invalidate_tool_availability_cache()
     return {"ok": True, "name": name, "enabled": body.enabled}
 
 
@@ -7342,6 +7363,7 @@ async def select_toolset_provider(name: str, body: ToolsetProviderSelect):
     except KeyError as exc:
         raise HTTPException(status_code=400, detail=str(exc).strip('"'))
     save_config(config)
+    _invalidate_tool_availability_cache()
     return {"ok": True, "name": name, "provider": body.provider}
 
 

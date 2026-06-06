@@ -5801,6 +5801,9 @@ def _(rid, params: dict) -> dict:
         from hermes_cli.config import reload_env
 
         count = reload_env()
+        from tools.registry import invalidate_check_fn_cache
+
+        invalidate_check_fn_cache()
         return _ok(rid, {"updated": int(count)})
     except Exception as e:
         return _err(rid, 5015, str(e))

@@ -16,6 +16,9 @@ describe('desktop slash command curation', () => {
     expect(isDesktopSlashSuggestion('/skin')).toBe(true)
     expect(isDesktopSlashSuggestion('/usage')).toBe(true)
     expect(isDesktopSlashSuggestion('/yolo')).toBe(true)
+    expect(isDesktopSlashSuggestion('/reload')).toBe(true)
+    expect(isDesktopSlashSuggestion('/toolsets')).toBe(true)
+    expect(isDesktopSlashSuggestion('/tools')).toBe(true)
     expect(isDesktopSlashCommand('/yolo')).toBe(true)
   })
 
@@ -113,5 +116,7 @@ describe('desktop slash command curation', () => {
     expect(desktopSlashUnavailableMessage('/model sonnet')).toContain('model picker')
     expect(desktopSlashUnavailableMessage('/skills')).toContain('desktop sidebar')
     expect(desktopSlashUnavailableMessage('/clear')).toContain('terminal interface')
+    expect(desktopSlashUnavailableMessage('/reload')).toBeNull()
+    expect(desktopSlashUnavailableMessage('/tools')).toBeNull()
   })
 })

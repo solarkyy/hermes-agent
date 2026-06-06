@@ -37,10 +37,15 @@ const DESKTOP_COMMAND_META = [
   ['/retry', 'Retry the last user message'],
   ['/rollback', 'List or restore filesystem checkpoints'],
   ['/skin', 'Switch desktop theme or cycle to the next one'],
+  ['/reload', 'Reload .env variables into the running session'],
+  ['/reload-mcp', 'Reload MCP server connections'],
+  ['/reload-skills', 'Reload skill definitions from disk'],
   ['/status', 'Show current session status'],
   ['/steer', 'Steer the current run after the next tool call'],
   ['/stop', 'Stop running background processes'],
   ['/title', 'Rename the current session'],
+  ['/toolsets', 'List enabled toolsets for this session'],
+  ['/tools', 'Open toolsets in the sidebar'],
   ['/undo', 'Remove the last user/assistant exchange'],
   ['/usage', 'Show token usage for this session'],
   ['/yolo', 'Toggle YOLO — auto-approve dangerous commands']
@@ -87,7 +92,6 @@ const TERMINAL_ONLY_COMMANDS = new Set([
   '/plugins',
   '/quit',
   '/redraw',
-  '/reload',
   '/restart',
   '/save',
   '/sb',
@@ -96,8 +100,6 @@ const TERMINAL_ONLY_COMMANDS = new Set([
   '/snap',
   '/snapshot',
   '/statusbar',
-  '/toolsets',
-  '/tools',
   '/update',
   '/verbose'
 ])
@@ -113,8 +115,6 @@ const ADVANCED_COMMANDS = new Set([
   '/kanban',
   '/personality',
   '/reasoning',
-  '/reload-mcp',
-  '/reload-skills',
   '/voice'
 ])
 

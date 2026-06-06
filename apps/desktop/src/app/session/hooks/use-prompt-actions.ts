@@ -554,6 +554,28 @@ export function usePromptActions({
           return
         }
 
+        if (normalizedName === 'reload') {
+          try {
+            const result = await requestGateway<{ count?: number; updated?: number }>('reload.env', {
+              session_id: sessionId
+            })
+            const count = typeof result?.updated === 'number' ? result.updated : result?.count
+            renderSlashOutput(`Reloaded .env (${typeof count === 'number' ? count : 'unknown'} var(s) updated)`)
+          } catch (err) {
+            renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
+          }
+
+          return
+        }
+
+        if (normalizedName === 'tools') {
+          renderSlashOutput(
+            'Open Skills → Toolsets in the sidebar to enable toolsets and configure API keys. Changes apply to new sessions.'
+          )
+
+          return
+        }
+
         if (name === 'help' || name === 'commands') {
           try {
             const catalog = await requestGateway<CommandsCatalogLike>('commands.catalog', { session_id: sessionId })

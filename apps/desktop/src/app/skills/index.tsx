@@ -1,4 +1,5 @@
 import type * as React from 'react'
+import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 
 import { PageLoader } from '@/components/page-loader'
@@ -8,7 +9,10 @@ import { TextTab, TextTabMeta } from '@/components/ui/text-tab'
 import { getSkills, getToolsets, toggleSkill, toggleToolset } from '@/hermes'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
+import { $activeSessionId } from '@/store/session'
 import type { SkillInfo, ToolsetInfo } from '@/types/hermes'
+
+import { useGatewayRequest } from '../gateway/hooks/use-gateway-request'
 
 import { useRefreshHotkey } from '../hooks/use-refresh-hotkey'
 import { useRouteEnumParam } from '../hooks/use-route-enum-param'
@@ -20,6 +24,31 @@ import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
 
 const SKILLS_MODES = ['skills', 'toolsets'] as const
 type SkillsMode = (typeof SKILLS_MODES)[number]
+
+interface SessionToolsetRow {
+  enabled: boolean
+  name: string
+}
+
+function runtimeStatusLabel(toolset: ToolsetInfo): string {
+  if (toolset.available) {
+    return 'Runtime OK'
+  }
+
+  return 'Unavailable'
+}
+
+function agentReadyLabel(toolset: ToolsetInfo): string | null {
+  if (!toolset.enabled) {
+    return null
+  }
+
+  if (toolset.agent_ready ?? (toolset.enabled && toolset.available)) {
+    return 'Agent ready'
+  }
+
+  return 'Enabled, not ready'
+}
 
 function categoryFor(skill: SkillInfo): string {
   return asText(skill.category) || 'general'
@@ -71,10 +100,13 @@ interface SkillsViewProps extends React.ComponentProps<'section'> {
 
 export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...props }: SkillsViewProps) {
   const [mode, setMode] = useRouteEnumParam('tab', SKILLS_MODES, 'skills')
+  const activeSessionId = useStore($activeSessionId)
+  const { requestGateway } = useGatewayRequest()
 
   const [query, setQuery] = useState('')
   const [skills, setSkills] = useState<SkillInfo[] | null>(null)
   const [toolsets, setToolsets] = useState<ToolsetInfo[] | null>(null)
+  const [sessionToolsets, setSessionToolsets] = useState<SessionToolsetRow[] | null>(null)
   const [activeCategory, setActiveCategory] = useState<string | null>(null)
   const [savingSkill, setSavingSkill] = useState<string | null>(null)
   const [savingToolset, setSavingToolset] = useState<string | null>(null)
@@ -92,11 +124,34 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
 
   useRefreshHotkey(refreshCapabilities)
 
-  const refreshToolsets = useCallback(() => {
-    getToolsets()
-      .then(setToolsets)
-      .catch(err => notifyError(err, 'Toolsets failed to refresh'))
+  const refreshToolsets = useCallback(async () => {
+    try {
+      setToolsets(await getToolsets())
+    } catch (err) {
+      notifyError(err, 'Toolsets failed to refresh')
+    }
   }, [])
+
+  const refreshSessionToolsets = useCallback(async () => {
+    if (!activeSessionId) {
+      setSessionToolsets(null)
+
+      return
+    }
+
+    try {
+      const result = await requestGateway<{ toolsets?: SessionToolsetRow[] }>('tools.list', {
+        session_id: activeSessionId
+      })
+      setSessionToolsets(result.toolsets ?? [])
+    } catch {
+      setSessionToolsets(null)
+    }
+  }, [activeSessionId, requestGateway])
+
+  useEffect(() => {
+    void refreshSessionToolsets()
+  }, [refreshSessionToolsets, toolsets])
 
   useEffect(() => {
     void refreshCapabilities()
@@ -139,6 +194,11 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
 
   const totalSkills = skills?.length || 0
   const enabledToolsets = toolsets?.filter(toolset => toolset.enabled).length || 0
+  const agentReadyToolsets = toolsets?.filter(toolset => toolset.agent_ready ?? (toolset.enabled && toolset.available)).length || 0
+  const sessionEnabledToolsets = useMemo(
+    () => (sessionToolsets ?? []).filter(row => row.enabled).map(row => row.name),
+    [sessionToolsets]
+  )
 
   async function handleToggleSkill(skill: SkillInfo, enabled: boolean) {
     setSavingSkill(skill.name)
@@ -163,10 +223,7 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
 
     try {
       await toggleToolset(toolset.name, enabled)
-      setToolsets(
-        current =>
-          current?.map(row => (row.name === toolset.name ? { ...row, enabled, available: enabled } : row)) ?? current
-      )
+      await refreshToolsets()
       notify({
         kind: 'success',
         title: enabled ? 'Toolset enabled' : 'Toolset disabled',
@@ -261,14 +318,24 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
             <EmptyState description="Try a broader search query." title="No toolsets found" />
           ) : (
             <div className="space-y-2">
-              <div className="text-xs text-muted-foreground">
-                {enabledToolsets}/{toolsets.length} toolsets enabled
+              <div className="space-y-1 text-xs text-muted-foreground">
+                <div>
+                  {enabledToolsets}/{toolsets.length} enabled · {agentReadyToolsets} agent-ready for new sessions
+                </div>
+                <div>Toggle changes apply to new chats. The active chat keeps the toolsets it started with.</div>
               </div>
+              {activeSessionId && sessionToolsets && (
+                <div className="rounded-md border border-(--ui-border-secondary) bg-(--ui-bg-quinary) px-3 py-2 text-xs text-muted-foreground">
+                  Active session toolsets:{' '}
+                  {sessionEnabledToolsets.length > 0 ? sessionEnabledToolsets.join(', ') : 'none enabled'}
+                </div>
+              )}
               <div>
                 {visibleToolsets.map(toolset => {
                   const tools = toolNames(toolset)
                   const label = toolsetDisplayLabel(toolset)
                   const expanded = expandedToolset === toolset.name
+                  const readyLabel = agentReadyLabel(toolset)
 
                   return (
                     <div className="px-0 py-2.5" key={toolset.name}>
@@ -288,6 +355,12 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
                               {toolset.configured ? 'Configured' : 'Needs keys'}
                             </StatusPill>
                           </button>
+                          <StatusPill active={toolset.available}>{runtimeStatusLabel(toolset)}</StatusPill>
+                          {readyLabel ? (
+                            <StatusPill active={Boolean(toolset.agent_ready ?? (toolset.enabled && toolset.available))}>
+                              {readyLabel}
+                            </StatusPill>
+                          ) : null}
                           <Switch
                             aria-label={`Toggle ${label} toolset`}
                             checked={toolset.enabled}
