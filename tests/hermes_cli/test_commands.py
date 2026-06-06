@@ -626,6 +626,7 @@ class TestSubcommands:
         assert "/voice" in SUBCOMMANDS
         assert "on" in SUBCOMMANDS["/voice"]
         assert "off" in SUBCOMMANDS["/voice"]
+        assert "phone" in SUBCOMMANDS["/voice"]
 
     def test_cron_has_subcommands(self):
         assert "/cron" in SUBCOMMANDS

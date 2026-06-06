@@ -11967,6 +11967,11 @@ class GatewayRunner:
             return await self._handle_voice_channel_join(event)
         elif args == "leave":
             return await self._handle_voice_channel_leave(event)
+        elif args in {"phone", "relay"} or args.startswith("phone ") or args.startswith("relay "):
+            return (
+                "Phone browser voice relay is a terminal-only feature for SSH sessions. "
+                "Run it in the Hermes CLI with `/voice phone`; for messaging, send a native voice message here instead."
+            )
         elif args == "status":
             mode = self._voice_mode.get(voice_key, "off")
             labels = {

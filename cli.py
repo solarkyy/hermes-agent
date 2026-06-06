@@ -3449,6 +3449,10 @@ class HermesCLI:
         self._voice_continuous = False
         self._voice_tts_done = threading.Event()
         self._voice_tts_done.set()
+        self._voice_phone_relay_proc = None
+        self._voice_phone_relay_url = None
+        self._voice_phone_relay_log = None
+        self._voice_phone_relay_meta = {}
 
         # Status bar visibility (toggled via /statusbar)
         self._status_bar_visible = True
@@ -11519,9 +11523,12 @@ class HermesCLI:
             self._voice_tts_done.set()
 
     def _handle_voice_command(self, command: str):
-        """Handle /voice [on|off|tts|status] command."""
+        """Handle /voice [on|off|tts|status|phone] command."""
         parts = command.strip().split(maxsplit=1)
-        subcommand = parts[1].lower().strip() if len(parts) > 1 else ""
+        raw_subcommand = parts[1].strip() if len(parts) > 1 else ""
+        sub_parts = raw_subcommand.split(maxsplit=1)
+        subcommand = sub_parts[0].lower() if sub_parts else ""
+        sub_args = sub_parts[1] if len(sub_parts) > 1 else ""
 
         if subcommand == "on":
             self._enable_voice_mode()
@@ -11531,6 +11538,8 @@ class HermesCLI:
             self._toggle_voice_tts()
         elif subcommand == "status":
             self._show_voice_status()
+        elif subcommand in {"phone", "relay"}:
+            self._handle_voice_phone_command(sub_args)
         elif subcommand == "":
             # Toggle
             if self._voice_mode:
@@ -11538,8 +11547,185 @@ class HermesCLI:
             else:
                 self._enable_voice_mode()
         else:
-            _cprint(f"Unknown voice subcommand: {subcommand}")
-            _cprint("Usage: /voice [on|off|tts|status]")
+            _cprint(f"Unknown voice subcommand: {raw_subcommand.lower().strip()}")
+            _cprint("Usage: /voice [on|off|tts|status|phone]")
+
+    def _voice_phone_relay_running(self) -> bool:
+        proc = getattr(self, "_voice_phone_relay_proc", None)
+        return bool(proc is not None and proc.poll() is None)
+
+    def _handle_voice_phone_command(self, argline: str = ""):
+        """Start/stop the phone-browser voice relay for SSH sessions.
+
+        Classic ``/voice on`` records from the machine running Hermes. Over SSH
+        that machine usually has no phone microphone, so ``/voice phone`` starts
+        a localhost web relay: phone browser mic -> SSH local forward -> Hermes
+        STT. It is draft-only by default and never presses Enter unless the
+        operator explicitly starts it with ``--allow-send``.
+        """
+        import shlex
+
+        try:
+            tokens = shlex.split(argline or "")
+        except ValueError as exc:
+            _cprint(f"Invalid /voice phone arguments: {exc}")
+            return
+
+        action = tokens[0].lower() if tokens else "start"
+        if action in {"off", "stop"}:
+            self._stop_voice_phone_relay()
+            return
+        if action == "status":
+            self._show_voice_phone_status()
+            return
+        if action == "restart":
+            self._stop_voice_phone_relay(quiet=True)
+            self._start_voice_phone_relay(tokens[1:])
+            return
+        if action in {"help", "-h", "--help"}:
+            self._print_voice_phone_usage()
+            return
+
+        self._start_voice_phone_relay(tokens)
+
+    def _print_voice_phone_usage(self) -> None:
+        _cprint("Usage: /voice phone [--port N] [--tmux-target TARGET|--no-tmux] [--model MODEL] [--max-mb N] [--allow-send]")
+        _cprint(f"{_DIM}Default: binds 127.0.0.1, token-protected, draft-only, and uses current $TMUX_PANE if present. Stop with /voice phone off.{_RST}")
+
+    def _start_voice_phone_relay(self, tokens: list[str]) -> None:
+        if self._voice_phone_relay_running():
+            _cprint(f"{_ACCENT}Phone voice relay already running.{_RST}")
+            self._show_voice_phone_status()
+            return
+
+        port = 8788
+        tmux_target = os.environ.get("TMUX_PANE") or None
+        model = None
+        max_mb = None
+        allow_send = False
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+            if token == "--port" and i + 1 < len(tokens):
+                try:
+                    port = int(tokens[i + 1])
+                except ValueError:
+                    _cprint("/voice phone: --port must be an integer")
+                    return
+                i += 2
+            elif token == "--tmux-target" and i + 1 < len(tokens):
+                tmux_target = tokens[i + 1]
+                i += 2
+            elif token == "--no-tmux":
+                tmux_target = None
+                i += 1
+            elif token == "--model" and i + 1 < len(tokens):
+                model = tokens[i + 1]
+                i += 2
+            elif token == "--max-mb" and i + 1 < len(tokens):
+                max_mb = tokens[i + 1]
+                i += 2
+            elif token == "--allow-send":
+                allow_send = True
+                i += 1
+            else:
+                _cprint(f"/voice phone: unknown or incomplete option: {token}")
+                self._print_voice_phone_usage()
+                return
+
+        import secrets
+        import subprocess
+
+        relay_script = Path(__file__).resolve().parent / "tools" / "phone_voice_relay.py"
+        if not relay_script.exists():
+            _cprint("/voice phone unavailable: tools/phone_voice_relay.py is missing")
+            return
+
+        relay_token = secrets.token_urlsafe(18)
+        cmd = [sys.executable, str(relay_script), "--port", str(port), "--token", relay_token]
+        if tmux_target:
+            cmd.extend(["--tmux-target", tmux_target])
+        if model:
+            cmd.extend(["--model", model])
+        if max_mb:
+            cmd.extend(["--max-mb", str(max_mb)])
+        if allow_send:
+            cmd.append("--allow-send")
+
+        log_path = os.path.join(tempfile.gettempdir(), "hermes_phone_voice_relay_cli.log")
+        try:
+            log_fh = open(log_path, "ab")
+            proc = subprocess.Popen(cmd, stdout=log_fh, stderr=log_fh, start_new_session=True)
+            log_fh.close()
+        except Exception as exc:
+            _cprint(f"Failed to start phone voice relay: {exc}")
+            return
+
+        time.sleep(0.4)
+        if proc.poll() is not None:
+            _cprint(f"Phone voice relay exited immediately (code {proc.returncode}). Log: {log_path}")
+            return
+
+        url = f"http://127.0.0.1:{port}/?token={relay_token}"
+        self._voice_phone_relay_proc = proc
+        self._voice_phone_relay_url = url
+        self._voice_phone_relay_log = log_path
+        try:
+            atexit.register(self._stop_voice_phone_relay, True)
+        except Exception:
+            pass
+        self._voice_phone_relay_meta = {
+            "port": port,
+            "tmux_target": tmux_target,
+            "allow_send": allow_send,
+            "model": model,
+        }
+
+        _cprint(f"\n{_ACCENT}Phone voice relay enabled{_RST}")
+        _cprint(f"  {_BOLD}Open on phone:{_RST} {url}")
+        _cprint(f"  {_DIM}If your SSH session lacks forwarding, reconnect with:{_RST}")
+        _cprint(f"  ssh -L {port}:127.0.0.1:{port} <host>")
+        if tmux_target:
+            _cprint(f"  {_DIM}tmux draft target: {tmux_target}{_RST}")
+        else:
+            _cprint(f"  {_DIM}copy-only mode: no tmux target configured{_RST}")
+        _cprint(f"  {_DIM}auto-send: {'enabled' if allow_send else 'disabled'}; stop with /voice phone off{_RST}")
+
+    def _show_voice_phone_status(self) -> None:
+        if not self._voice_phone_relay_running():
+            _cprint(f"{_DIM}Phone voice relay is not running. Start with /voice phone.{_RST}")
+            return
+        meta = getattr(self, "_voice_phone_relay_meta", {}) or {}
+        _cprint(f"\n{_BOLD}Phone Voice Relay Status{_RST}")
+        _cprint("  Mode:      ON")
+        _cprint(f"  URL:       {getattr(self, '_voice_phone_relay_url', '<unknown>')}")
+        _cprint(f"  Port:      {meta.get('port', '<unknown>')}")
+        _cprint(f"  tmux:      {meta.get('tmux_target') or 'copy-only'}")
+        _cprint(f"  auto-send: {'ON' if meta.get('allow_send') else 'OFF'}")
+        _cprint(f"  Log:       {getattr(self, '_voice_phone_relay_log', '<unknown>')}")
+
+    def _stop_voice_phone_relay(self, quiet: bool = False) -> None:
+        proc = getattr(self, "_voice_phone_relay_proc", None)
+        if proc is None or proc.poll() is not None:
+            self._voice_phone_relay_proc = None
+            self._voice_phone_relay_url = None
+            self._voice_phone_relay_meta = {}
+            if not quiet:
+                _cprint(f"{_DIM}Phone voice relay is not running.{_RST}")
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        self._voice_phone_relay_proc = None
+        self._voice_phone_relay_url = None
+        self._voice_phone_relay_meta = {}
+        if not quiet:
+            _cprint(f"{_DIM}Phone voice relay stopped.{_RST}")
 
     def _voice_beeps_enabled(self) -> bool:
         """Return whether CLI voice mode should play record start/stop beeps."""
@@ -13250,6 +13436,10 @@ class HermesCLI:
         self._voice_continuous = False  # Whether to auto-restart after agent responds
         self._voice_tts_done = threading.Event()  # Signals TTS playback finished
         self._voice_tts_done.set()  # Initially "done" (no TTS pending)
+        self._voice_phone_relay_proc = None
+        self._voice_phone_relay_url = None
+        self._voice_phone_relay_log = None
+        self._voice_phone_relay_meta = {}
 
         if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
             self._install_tool_callbacks()

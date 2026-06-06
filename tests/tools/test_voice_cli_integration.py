@@ -29,6 +29,10 @@ def _make_voice_cli(**overrides):
     cli._voice_continuous = False
     cli._voice_tts_done = threading.Event()
     cli._voice_tts_done.set()
+    cli._voice_phone_relay_proc = None
+    cli._voice_phone_relay_url = None
+    cli._voice_phone_relay_log = None
+    cli._voice_phone_relay_meta = {}
     cli._pending_input = queue.Queue()
     cli._app = None
     cli._attached_images = []
@@ -811,6 +815,7 @@ class TestHandleVoiceCommandReal:
         cli._disable_voice_mode = MagicMock()
         cli._toggle_voice_tts = MagicMock()
         cli._show_voice_status = MagicMock()
+        cli._handle_voice_phone_command = MagicMock()
         return cli
 
     @patch("cli._cprint")
@@ -852,6 +857,18 @@ class TestHandleVoiceCommandReal:
         cli._enable_voice_mode.assert_called_once()
 
     @patch("cli._cprint")
+    def test_phone_calls_phone_relay_handler(self, _cp):
+        cli = self._cli()
+        cli._handle_voice_command("/voice phone --port 8790")
+        cli._handle_voice_phone_command.assert_called_once_with("--port 8790")
+
+    @patch("cli._cprint")
+    def test_relay_alias_calls_phone_relay_handler(self, _cp):
+        cli = self._cli()
+        cli._handle_voice_command("/voice relay status")
+        cli._handle_voice_phone_command.assert_called_once_with("status")
+
+    @patch("cli._cprint")
     def test_unknown_subcommand(self, mock_cp):
         cli = self._cli()
         cli._handle_voice_command("/voice foobar")
@@ -860,6 +877,77 @@ class TestHandleVoiceCommandReal:
         # Should print usage via _cprint
         assert any("Unknown" in str(c) or "unknown" in str(c)
                     for c in mock_cp.call_args_list)
+
+
+class TestVoicePhoneRelayReal:
+    @patch("cli._cprint")
+    @patch("cli.time.sleep", return_value=None)
+    @patch("subprocess.Popen")
+    def test_voice_phone_start_uses_safe_localhost_relay(self, mock_popen, _sleep, _cp, tmp_path, monkeypatch):
+        monkeypatch.delenv("TMUX_PANE", raising=False)
+        cli = _make_voice_cli()
+        fake_proc = MagicMock()
+        fake_proc.poll.return_value = None
+        mock_popen.return_value = fake_proc
+        monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+
+        cli._handle_voice_phone_command("--port 8790 --tmux-target %7")
+
+        cmd = mock_popen.call_args.args[0]
+        assert "phone_voice_relay.py" in cmd[1]
+        assert "--port" in cmd and "8790" in cmd
+        assert "--tmux-target" in cmd and "%7" in cmd
+        assert "--allow-send" not in cmd
+        assert cli._voice_phone_relay_proc is fake_proc
+        assert cli._voice_phone_relay_url.startswith("http://127.0.0.1:8790/?token=")
+        assert cli._voice_phone_relay_meta["allow_send"] is False
+
+    @patch("cli._cprint")
+    @patch("cli.time.sleep", return_value=None)
+    @patch("subprocess.Popen")
+    def test_voice_phone_uses_current_tmux_pane_by_default(self, mock_popen, _sleep, _cp, monkeypatch):
+        cli = _make_voice_cli()
+        fake_proc = MagicMock()
+        fake_proc.poll.return_value = None
+        mock_popen.return_value = fake_proc
+        monkeypatch.setenv("TMUX_PANE", "%12")
+
+        cli._handle_voice_phone_command("--port 8792")
+
+        cmd = mock_popen.call_args.args[0]
+        assert "--tmux-target" in cmd and "%12" in cmd
+        assert cli._voice_phone_relay_meta["tmux_target"] == "%12"
+
+    @patch("cli._cprint")
+    @patch("cli.time.sleep", return_value=None)
+    @patch("subprocess.Popen")
+    def test_voice_phone_no_tmux_overrides_current_tmux_pane(self, mock_popen, _sleep, _cp, monkeypatch):
+        cli = _make_voice_cli()
+        fake_proc = MagicMock()
+        fake_proc.poll.return_value = None
+        mock_popen.return_value = fake_proc
+        monkeypatch.setenv("TMUX_PANE", "%12")
+
+        cli._handle_voice_phone_command("--port 8793 --no-tmux")
+
+        cmd = mock_popen.call_args.args[0]
+        assert "--tmux-target" not in cmd
+        assert cli._voice_phone_relay_meta["tmux_target"] is None
+
+    @patch("cli._cprint")
+    def test_voice_phone_stop_terminates_running_relay(self, _cp):
+        cli = _make_voice_cli()
+        fake_proc = MagicMock()
+        fake_proc.poll.return_value = None
+        cli._voice_phone_relay_proc = fake_proc
+        cli._voice_phone_relay_url = "http://127.0.0.1:8788/?token=test"
+
+        cli._handle_voice_phone_command("off")
+
+        fake_proc.terminate.assert_called_once()
+        fake_proc.wait.assert_called_once_with(timeout=3)
+        assert cli._voice_phone_relay_proc is None
+        assert cli._voice_phone_relay_url is None
 
 
 class TestEnableVoiceModeReal:

@@ -45,6 +45,7 @@ import tempfile
 import time
 import threading
 import uuid
+from types import SimpleNamespace
 from typing import List, Dict, Any, Optional
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
