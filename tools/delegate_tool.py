@@ -19,9 +19,15 @@ never the child's intermediate tool calls or reasoning.
 import enum
 import json
 import logging
+import os
+import shlex
+import subprocess
+import tempfile
+import uuid
 
 logger = logging.getLogger(__name__)
 import os
+import platform
 import threading
 import time
 from concurrent.futures import (
@@ -1345,6 +1351,26 @@ def _run_single_child(
     Run a pre-built child agent. Called from within a thread.
     Returns a structured result dict.
     """
+    # Legacy Pi short-circuit (pre-_run_child dispatch). Kept for callers
+    # that still invoke _run_single_child with a pre-resolved proxy.
+    if isinstance(child, _PiChildProxy):
+        pi_result = getattr(child, "_pi_result", {})
+        findings = pi_result.get("findings", {}) if isinstance(pi_result, dict) else {}
+        raw_output = pi_result.get("raw_output", "") if isinstance(pi_result, dict) else ""
+        duration = round(time.monotonic() - 0, 2)  # approximate, Pi timing is in pi_result
+        return {
+            "task_index": task_index,
+            "status": "completed" if pi_result.get("success") else "failed",
+            "summary": raw_output or "Pi delegation completed",
+            "error": None if pi_result.get("success") else pi_result.get("error", "Pi delegation failed"),
+            "exit_reason": "completed" if pi_result.get("success") else "error",
+            "api_calls": 0,
+            "duration_seconds": duration,
+            "_child_role": getattr(child, "role", None),
+            "pi_findings": findings,
+            "pi_source": pi_result.get("source", "pi-sister-spawn"),
+        }
+
     child_start = time.monotonic()
 
     # Get the progress callback from the child agent
@@ -1931,6 +1957,300 @@ def _recover_tasks_from_json_string(
     return parsed, None
 
 
+def _get_pi_delegation_enabled() -> bool:
+    """Return True when delegate_task should route to Pi sister-spawn.
+
+    Opt-in only — Hermes child agents are the default. Enable via
+    ``delegation.pi_mode: true`` in config or ``HERMES_DELEGATION_PI_MODE=1``.
+    """
+    env = os.getenv("HERMES_DELEGATION_PI_MODE", "").strip().lower()
+    if env in {"1", "true", "yes", "on"}:
+        return True
+    if env in {"0", "false", "no", "off"}:
+        return False
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config().get("delegation") or {}
+    except Exception:
+        cfg = _load_config()
+    return bool(cfg.get("pi_mode"))
+
+
+def _task_requests_pi_delegation(task: Dict[str, Any]) -> bool:
+    """Per-task override: ``pi_delegation: true`` or ``backend: \"pi\"``."""
+    if task.get("pi_delegation") is True:
+        return True
+    backend = str(task.get("backend") or "").strip().lower()
+    return backend in {"pi", "pi_sister", "omnira-pi"}
+
+
+def _should_use_pi_delegation(task: Dict[str, Any]) -> bool:
+    return _task_requests_pi_delegation(task) or _get_pi_delegation_enabled()
+
+
+def _running_on_kjdesk() -> bool:
+    hostname = platform.node().lower()
+    return "kjoly" in hostname or "kjdesk" in hostname
+
+
+class _PiChildProxy:
+    """Lazy Pi sister-spawn handle — execution happens in _run_pi_delegation_child."""
+
+    _is_pi_delegation_proxy = True
+
+    def __init__(
+        self,
+        task_index: int,
+        goal: str,
+        context: Optional[str],
+        toolsets: Optional[List[str]],
+        role: str,
+        parent_session_id: Optional[str],
+        saved_tool_names: List[str],
+    ):
+        self.task_index = task_index
+        self.goal = goal
+        self.context = context
+        self.toolsets = toolsets
+        self.role = role
+        self._delegate_role = role
+        self.parent_session_id = parent_session_id
+        self._delegate_saved_tool_names = saved_tool_names
+
+
+def _format_pi_delegation_summary(pi_result: Dict[str, Any]) -> str:
+    if pi_result.get("findings") is not None:
+        return json.dumps(pi_result["findings"], indent=2, ensure_ascii=False)
+    raw = pi_result.get("raw_output")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return json.dumps(pi_result, indent=2, ensure_ascii=False)
+
+
+def _run_pi_delegation_child(
+    task_index: int,
+    goal: str,
+    child: _PiChildProxy,
+    parent_agent=None,
+    **_kwargs,
+) -> Dict[str, Any]:
+    """Execute Pi sister-spawn and return the same entry shape as _run_single_child."""
+    child_start = time.monotonic()
+    if parent_agent is not None:
+        touch = getattr(parent_agent, "_touch_activity", None)
+        if touch:
+            try:
+                touch(f"delegate_task: Pi sister-spawn for subagent {task_index}")
+            except Exception:
+                pass
+
+    pi_result = _delegate_to_pi_sister(
+        task_index=task_index,
+        goal=child.goal,
+        context=child.context,
+        toolsets=child.toolsets,
+        role=child.role,
+        parent_session_id=child.parent_session_id,
+    )
+    duration = round(time.monotonic() - child_start, 2)
+
+    if not pi_result.get("success"):
+        return {
+            "task_index": task_index,
+            "status": "error",
+            "summary": None,
+            "error": pi_result.get("error", "Pi delegation failed"),
+            "api_calls": 0,
+            "duration_seconds": duration,
+            "exit_reason": "error",
+            "tokens": {"input": 0, "output": 0},
+            "tool_trace": [],
+            "_child_role": child.role,
+            "pi_delegation": True,
+            "pi_source": pi_result.get("source"),
+        }
+
+    summary = _format_pi_delegation_summary(pi_result)
+    return {
+        "task_index": task_index,
+        "status": "completed" if summary else "failed",
+        "summary": summary,
+        "error": None if summary else "Pi delegation returned empty output",
+        "api_calls": 0,
+        "duration_seconds": duration,
+        "exit_reason": "completed" if summary else "failed",
+        "tokens": {"input": 0, "output": 0},
+        "tool_trace": [{"tool": "pi_sister_spawn", "status": "ok"}],
+        "_child_role": child.role,
+        "pi_delegation": True,
+        "pi_source": pi_result.get("source"),
+    }
+
+
+def _run_child(
+    task_index: int,
+    goal: str,
+    child=None,
+    parent_agent=None,
+    **_kwargs,
+) -> Dict[str, Any]:
+    """Dispatch to Hermes child agent loop or Pi sister-spawn proxy."""
+    if isinstance(child, _PiChildProxy):
+        return _run_pi_delegation_child(
+            task_index=task_index,
+            goal=goal,
+            child=child,
+            parent_agent=parent_agent,
+        )
+    return _run_single_child(
+        task_index=task_index,
+        goal=goal,
+        child=child,
+        parent_agent=parent_agent,
+    )
+
+
+def _delegate_to_pi_sister(
+    task_index: int,
+    goal: str,
+    context: Optional[str],
+    toolsets: Optional[List[str]],
+    role: str,
+    parent_session_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Delegate a task to Pi's ``pi-sister-spawn.mjs`` (opt-in backend only)."""
+    sister_rel = os.getenv(
+        "HERMES_PI_SISTER_SPAWN",
+        "tools/pi-sister-spawn.mjs",
+    )
+    omnios_root = os.path.expanduser(
+        os.getenv("HERMES_PI_OMNIOS_ROOT", "~/Desktop/omnios")
+    )
+    ssh_host = os.getenv("HERMES_PI_SSH_HOST", "kylej@192.168.5.196")
+    worker_model = os.getenv("HERMES_PI_WORKER_MODEL", "openai-codex/gpt-5.5")
+    lane = os.getenv("HERMES_PI_DELEGATE_LANE", "coord")
+
+    task_prompt = f"Task goal: {goal}\n\n"
+    if context:
+        task_prompt += f"Context: {context}\n\n"
+    if toolsets:
+        task_prompt += f"Available toolsets: {', '.join(toolsets)}\n\n"
+    task_prompt += f"Role: {role}\n\n"
+    task_prompt += (
+        "Execute this task with full audit/receipt/AOMS validation. "
+        "Return structured findings."
+    )
+
+    nonce = f"hermes-delegate-{uuid.uuid4().hex[:12]}"
+    cmd = [
+        "node",
+        sister_rel,
+        "--worker-model",
+        worker_model,
+        "--lane",
+        lane,
+        "--nonce",
+        nonce,
+        "--claim-ceiling",
+        "implementation with AOMS validation",
+        "--no-tools",
+    ]
+    if parent_session_id:
+        cmd.extend(["--parent-session-id", parent_session_id])
+
+    temp_path: Optional[str] = None
+    remote_temp_path: Optional[str] = None
+    try:
+        if len(task_prompt) <= 6000:
+            cmd.extend(["--task", task_prompt])
+        else:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".md", delete=False, encoding="utf-8"
+            ) as handle:
+                handle.write(task_prompt)
+                temp_path = handle.name
+            if _running_on_kjdesk():
+                cmd.extend(["--task-file", temp_path])
+            else:
+                remote_temp_path = f"/tmp/hermes-delegate-{nonce}.md"
+                scp = subprocess.run(
+                    ["scp", "-q", temp_path, f"{ssh_host}:{remote_temp_path}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                if scp.returncode != 0:
+                    return {
+                        "success": False,
+                        "error": f"Pi delegation scp failed: {scp.stderr}",
+                    }
+                cmd.extend(["--task-file", remote_temp_path])
+
+        if _running_on_kjdesk():
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                cwd=omnios_root,
+            )
+        else:
+            remote_cmd = " ".join(shlex.quote(part) for part in cmd)
+            result = subprocess.run(
+                [
+                    "ssh",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=8",
+                    ssh_host,
+                    f"cd {shlex.quote(omnios_root)} && {remote_cmd}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+
+        if result.returncode != 0:
+            logger.error("Pi sister-spawn failed: %s", result.stderr)
+            return {
+                "success": False,
+                "error": f"Pi delegation failed: {result.stderr or result.stdout}",
+            }
+
+        stdout = (result.stdout or "").strip()
+        if not stdout:
+            return {"success": False, "error": "Pi delegation returned empty stdout"}
+
+        try:
+            findings = json.loads(stdout)
+            return {"success": True, "findings": findings, "source": "pi-sister-spawn"}
+        except json.JSONDecodeError:
+            return {"success": True, "raw_output": stdout, "source": "pi-sister-spawn"}
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "Pi delegation timed out after 300s"}
+    except Exception as exc:
+        logger.error("Pi delegation failed: %s", exc)
+        return {"success": False, "error": str(exc)}
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+        if remote_temp_path and not _running_on_kjdesk():
+            try:
+                subprocess.run(
+                    ["ssh", ssh_host, f"rm -f {shlex.quote(remote_temp_path)}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+            except Exception:
+                pass
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -2074,31 +2394,42 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
-            child = _build_child_agent(
-                task_index=i,
-                goal=t["goal"],
-                context=t.get("context"),
-                toolsets=t.get("toolsets") or toolsets,
-                model=creds["model"],
-                max_iterations=effective_max_iter,
-                task_count=n_tasks,
-                parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_acp_command=t.get("acp_command")
-                or acp_command
-                or creds.get("command"),
-                override_acp_args=(
-                    task_acp_args
-                    if task_acp_args is not None
-                    else (acp_args if acp_args is not None else creds.get("args"))
-                ),
-                role=effective_role,
-            )
-            # Override with correct parent tool names (before child construction mutated global)
-            child._delegate_saved_tool_names = _parent_tool_names
+
+            if _should_use_pi_delegation(t):
+                child = _PiChildProxy(
+                    task_index=i,
+                    goal=t["goal"],
+                    context=t.get("context"),
+                    toolsets=t.get("toolsets") or toolsets,
+                    role=effective_role,
+                    parent_session_id=getattr(parent_agent, "session_id", None),
+                    saved_tool_names=_parent_tool_names,
+                )
+            else:
+                child = _build_child_agent(
+                    task_index=i,
+                    goal=t["goal"],
+                    context=t.get("context"),
+                    toolsets=t.get("toolsets") or toolsets,
+                    model=creds["model"],
+                    max_iterations=effective_max_iter,
+                    task_count=n_tasks,
+                    parent_agent=parent_agent,
+                    override_provider=creds["provider"],
+                    override_base_url=creds["base_url"],
+                    override_api_key=creds["api_key"],
+                    override_api_mode=creds["api_mode"],
+                    override_acp_command=t.get("acp_command")
+                    or acp_command
+                    or creds.get("command"),
+                    override_acp_args=(
+                        task_acp_args
+                        if task_acp_args is not None
+                        else (acp_args if acp_args is not None else creds.get("args"))
+                    ),
+                    role=effective_role,
+                )
+                child._delegate_saved_tool_names = _parent_tool_names
             children.append((i, t, child))
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
@@ -2107,7 +2438,7 @@ def delegate_task(
     if n_tasks == 1:
         # Single task -- run directly (no thread pool overhead)
         _i, _t, child = children[0]
-        result = _run_single_child(0, _t["goal"], child, parent_agent)
+        result = _run_child(0, _t["goal"], child, parent_agent)
         results.append(result)
     else:
         # Batch -- run in parallel with per-task progress lines
@@ -2118,7 +2449,7 @@ def delegate_task(
             futures = {}
             for i, t, child in children:
                 future = executor.submit(
-                    _run_single_child,
+                    _run_child,
                     task_index=i,
                     goal=t["goal"],
                     child=child,

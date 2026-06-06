@@ -1667,6 +1667,10 @@ DEFAULT_CONFIG = {
         # extras" without silently stripping MCP tools the parent already has.
         # Set to false for strict intersection.
         "inherit_mcp_toolsets": True,
+        # When true, delegate_task routes to Pi sister-spawn instead of Hermes
+        # child agents. Per-task override: pi_delegation: true or backend: "pi".
+        # Env: HERMES_DELEGATION_PI_MODE=1.
+        "pi_mode": False,
         "max_iterations": 50,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
         "child_timeout_seconds": 600,  # wall-clock timeout for each child agent (floor 30s,

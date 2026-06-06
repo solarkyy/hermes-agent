@@ -2666,5 +2666,85 @@ class TestFallbackModelInheritance(unittest.TestCase):
         self.assertIsNone(kwargs["fallback_model"])
 
 
+class TestPiDelegation(unittest.TestCase):
+    def test_default_uses_hermes_child_agent(self):
+        parent = _make_mock_parent()
+        with patch("tools.delegate_tool._get_pi_delegation_enabled", return_value=False), \
+             patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_child") as mock_run:
+            mock_child = MagicMock()
+            mock_build.return_value = mock_child
+            mock_run.return_value = {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "ok",
+                "api_calls": 1,
+                "duration_seconds": 0.1,
+            }
+            result = json.loads(delegate_task(goal="test goal", parent_agent=parent))
+            mock_build.assert_called_once()
+            self.assertIn("results", result)
+            self.assertEqual(result["results"][0]["status"], "completed")
+
+    def test_pi_mode_uses_proxy_not_build_child(self):
+        parent = _make_mock_parent()
+        with patch("tools.delegate_tool._should_use_pi_delegation", return_value=True), \
+             patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_child") as mock_run:
+            mock_run.return_value = {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "pi ok",
+                "api_calls": 0,
+                "duration_seconds": 1.0,
+                "pi_delegation": True,
+            }
+            result = json.loads(delegate_task(goal="pi task", parent_agent=parent))
+            mock_build.assert_not_called()
+            self.assertEqual(result["results"][0]["summary"], "pi ok")
+            self.assertTrue(result["results"][0].get("pi_delegation"))
+
+    def test_run_pi_delegation_child_success(self):
+        from tools.delegate_tool import _PiChildProxy, _run_pi_delegation_child
+
+        proxy = _PiChildProxy(
+            task_index=0,
+            goal="audit thing",
+            context="ctx",
+            toolsets=["web"],
+            role="leaf",
+            parent_session_id="sess-1",
+            saved_tool_names=["terminal"],
+        )
+        with patch(
+            "tools.delegate_tool._delegate_to_pi_sister",
+            return_value={"success": True, "findings": {"status": "PASS"}, "source": "pi-sister-spawn"},
+        ):
+            entry = _run_pi_delegation_child(0, "audit thing", proxy, parent_agent=None)
+        self.assertEqual(entry["status"], "completed")
+        self.assertIn("PASS", entry["summary"])
+        self.assertTrue(entry["pi_delegation"])
+
+    def test_run_pi_delegation_child_error(self):
+        from tools.delegate_tool import _PiChildProxy, _run_pi_delegation_child
+
+        proxy = _PiChildProxy(
+            task_index=1,
+            goal="fail",
+            context=None,
+            toolsets=None,
+            role="leaf",
+            parent_session_id=None,
+            saved_tool_names=[],
+        )
+        with patch(
+            "tools.delegate_tool._delegate_to_pi_sister",
+            return_value={"success": False, "error": "ssh failed"},
+        ):
+            entry = _run_pi_delegation_child(1, "fail", proxy, parent_agent=None)
+        self.assertEqual(entry["status"], "error")
+        self.assertIn("ssh failed", entry["error"])
+
+
 if __name__ == "__main__":
     unittest.main()

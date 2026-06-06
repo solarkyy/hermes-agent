@@ -172,91 +172,91 @@ class TestImageToBase64DataUrl:
 
 
 class TestHandleVisionAnalyze:
-    """Verify _handle_vision_analyze returns an Awaitable and builds correct prompt."""
+    """Verify _handle_vision_analyze routes Pi vs cloud vision correctly."""
 
-    def test_returns_awaitable(self):
+    @pytest.mark.asyncio
+    async def test_returns_awaitable(self):
         """The handler must return an Awaitable (coroutine) since it's registered as async."""
-        with patch(
-            "tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock
-        ) as mock_tool:
+        with (
+            patch("tools.vision_tools.check_pi_vision_requirements", return_value=False),
+            patch(
+                "tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock
+            ) as mock_tool,
+        ):
             mock_tool.return_value = json.dumps({"result": "ok"})
-            result = _handle_vision_analyze(
+            result = await _handle_vision_analyze(
                 {
                     "image_url": "https://example.com/img.png",
                     "question": "What is this?",
                 }
             )
-            # It should be an Awaitable (coroutine)
-            assert isinstance(result, Awaitable)
-            # Clean up the coroutine to avoid RuntimeWarning
-            result.close()
+            assert isinstance(result, str)
 
-    def test_prompt_contains_question(self):
+    @pytest.mark.asyncio
+    async def test_prompt_contains_question(self):
         """The full prompt should incorporate the user's question."""
-        with patch(
-            "tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock
-        ) as mock_tool:
+        with (
+            patch("tools.vision_tools.check_pi_vision_requirements", return_value=False),
+            patch(
+                "tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock
+            ) as mock_tool,
+        ):
             mock_tool.return_value = json.dumps({"result": "ok"})
-            coro = _handle_vision_analyze(
+            await _handle_vision_analyze(
                 {
                     "image_url": "https://example.com/img.png",
                     "question": "Describe the cat",
                 }
             )
-            # Clean up coroutine
-            coro.close()
             call_args = mock_tool.call_args
             full_prompt = call_args[0][1]  # second positional arg
             assert "Describe the cat" in full_prompt
             assert "Fully describe and explain" in full_prompt
 
-    def test_uses_auxiliary_vision_model_env(self):
-        """AUXILIARY_VISION_MODEL env var should override DEFAULT_VISION_MODEL."""
+    @pytest.mark.asyncio
+    async def test_pi_path_uses_configured_model(self):
         with (
+            patch("tools.vision_tools.check_pi_vision_requirements", return_value=True),
             patch(
-                "tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock
-            ) as mock_tool,
-            patch.dict(os.environ, {"AUXILIARY_VISION_MODEL": "custom/model-v1"}),
+                "tools.vision_tools._vision_analyze_pi", new_callable=AsyncMock
+            ) as mock_pi,
+            patch.dict(os.environ, {"HERMES_PI_VISION_MODEL": "custom/model-v1"}),
         ):
-            mock_tool.return_value = json.dumps({"result": "ok"})
-            coro = _handle_vision_analyze(
+            mock_pi.return_value = json.dumps({"result": "ok"})
+            await _handle_vision_analyze(
                 {"image_url": "https://example.com/img.png", "question": "test"}
             )
-            coro.close()
-            call_args = mock_tool.call_args
-            model = call_args[0][2]  # third positional arg
+            model = mock_pi.call_args.kwargs.get("model", mock_pi.call_args[0][2])
             assert model == "custom/model-v1"
 
-    def test_falls_back_to_default_model(self):
-        """Without AUXILIARY_VISION_MODEL, model should be None (let call_llm resolve default)."""
+    @pytest.mark.asyncio
+    async def test_cloud_fallback_lets_router_pick_model(self):
         with (
+            patch("tools.vision_tools.check_pi_vision_requirements", return_value=False),
             patch(
                 "tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock
             ) as mock_tool,
-            patch.dict(os.environ, {}, clear=False),
         ):
-            # Ensure AUXILIARY_VISION_MODEL is not set
             os.environ.pop("AUXILIARY_VISION_MODEL", None)
             mock_tool.return_value = json.dumps({"result": "ok"})
-            coro = _handle_vision_analyze(
+            await _handle_vision_analyze(
                 {"image_url": "https://example.com/img.png", "question": "test"}
             )
-            coro.close()
-            call_args = mock_tool.call_args
-            model = call_args[0][2]
-            # With no AUXILIARY_VISION_MODEL set, model should be None
-            # (the centralized call_llm router picks the default)
+            model = mock_tool.call_args.kwargs.get("model")
             assert model is None
 
-    def test_empty_args_graceful(self):
+    @pytest.mark.asyncio
+    async def test_empty_args_graceful(self):
         """Missing keys should default to empty strings, not raise."""
-        with patch(
-            "tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock
-        ) as mock_tool:
+        with (
+            patch("tools.vision_tools.check_pi_vision_requirements", return_value=False),
+            patch(
+                "tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock
+            ) as mock_tool,
+        ):
             mock_tool.return_value = json.dumps({"result": "ok"})
-            result = _handle_vision_analyze({})
-            assert isinstance(result, Awaitable)
-            result.close()
+            await _handle_vision_analyze({})
+            mock_tool.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

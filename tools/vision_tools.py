@@ -3,8 +3,11 @@
 Vision Tools Module
 
 This module provides vision analysis tools that work with image URLs.
-Uses the centralized auxiliary vision router, which can select OpenRouter,
-Nous, Codex, native Anthropic, or a custom OpenAI-compatible endpoint.
+The registered ``vision_analyze`` tool delegates image analysis to Pi-hosted
+Ollama/Moondream at 192.168.5.196:11434 instead of auxiliary cloud vision
+providers. Legacy helper functions for auxiliary/native vision are kept for
+callers that import them directly (video analysis still uses the auxiliary
+vision router).
 
 Available tools:
 - vision_analyze_tool: Analyze images from URLs with custom prompts
@@ -794,6 +797,364 @@ async def _vision_analyze_native(
                 pass
 
 
+# ---------------------------------------------------------------------------
+# Pi-hosted Moondream path
+# ---------------------------------------------------------------------------
+
+_PI_VISION_DEFAULT_ENDPOINT = "http://192.168.5.196:11434/api/generate"
+_PI_VISION_LOCAL_FALLBACKS = (
+    "http://127.0.0.1:11434/api/generate",
+    "http://localhost:11434/api/generate",
+)
+
+
+def _resolve_pi_vision_model() -> str:
+    """Return the Ollama model name for Pi vision delegation."""
+    return os.getenv("HERMES_PI_VISION_MODEL", "moondream").strip() or "moondream"
+
+
+def _resolve_pi_vision_timeout() -> float:
+    """Return the timeout for Pi/Ollama vision calls."""
+    for env_name in ("HERMES_PI_VISION_TIMEOUT", "HERMES_VISION_TIMEOUT"):
+        raw = os.getenv(env_name, "").strip()
+        if raw:
+            try:
+                return float(raw)
+            except ValueError:
+                logger.warning("Ignoring invalid %s=%r", env_name, raw)
+    return 180.0
+
+
+def _pi_vision_endpoint_candidates() -> list[str]:
+    """Return endpoint candidates for the Pi-hosted Ollama generate API.
+
+    The requested LAN endpoint is tried first.  On the Pi itself Ollama is
+    often bound only to 127.0.0.1, so localhost fallbacks keep delegation
+    working without requiring an Ollama rebind.
+    """
+    primary = (
+        os.getenv("HERMES_PI_VISION_ENDPOINT", _PI_VISION_DEFAULT_ENDPOINT).strip()
+        or _PI_VISION_DEFAULT_ENDPOINT
+    )
+    candidates = [primary]
+    for endpoint in _PI_VISION_LOCAL_FALLBACKS:
+        if endpoint not in candidates:
+            candidates.append(endpoint)
+    return candidates
+
+
+def _resolve_pi_vision_check_timeout() -> float:
+    """Return a short timeout for synchronous Pi availability checks."""
+    raw = os.getenv("HERMES_PI_VISION_CHECK_TIMEOUT", "").strip()
+    if raw:
+        try:
+            return max(float(raw), 0.1)
+        except ValueError:
+            logger.warning("Ignoring invalid HERMES_PI_VISION_CHECK_TIMEOUT=%r", raw)
+    return 2.0
+
+
+def _pi_vision_api_url(generate_endpoint: str, api_name: str) -> str:
+    """Convert an Ollama generate endpoint into another /api/* URL."""
+    endpoint = (generate_endpoint or _PI_VISION_DEFAULT_ENDPOINT).strip().rstrip("/")
+    if endpoint.endswith("/api/generate"):
+        return endpoint[: -len("/generate")] + f"/{api_name}"
+    if endpoint.endswith("/api"):
+        return f"{endpoint}/{api_name}"
+    return f"{endpoint}/api/{api_name}"
+
+
+def _pi_vision_model_name_matches(requested: str, available: str) -> bool:
+    """Return True when an Ollama tag satisfies the requested model name."""
+    requested = (requested or "").strip()
+    available = (available or "").strip()
+    if not requested or not available:
+        return False
+    if available == requested:
+        return True
+
+    requested_base, requested_sep, requested_tag = requested.partition(":")
+    available_base, available_sep, available_tag = available.partition(":")
+    if not requested_sep:
+        # HERMES_PI_VISION_MODEL=moondream should match moondream:latest and
+        # other installed moondream tags.
+        return available_base == requested_base
+    return (
+        available_base == requested_base
+        and bool(available_sep)
+        and available_tag == requested_tag
+    )
+
+
+def _pi_vision_tags_include_model(data: Dict[str, Any], model: str) -> bool:
+    """Return True when Ollama /api/tags output contains ``model``."""
+    models = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(models, list):
+        return False
+    for item in models:
+        if isinstance(item, dict):
+            name = str(item.get("name") or item.get("model") or "")
+        else:
+            name = str(item)
+        if _pi_vision_model_name_matches(model, name):
+            return True
+    return False
+
+
+def check_pi_vision_requirements() -> bool:
+    """Check that Pi-hosted Ollama/Moondream is reachable.
+
+    This is intentionally Pi-specific and does not fall back to auxiliary
+    cloud vision providers.  The primary target is
+    ``http://192.168.5.196:11434`` (or ``HERMES_PI_VISION_ENDPOINT``), with
+    localhost endpoints tried only after that so the same file works when run
+    directly on the Pi where Ollama may be bound to loopback.
+    """
+    model = _resolve_pi_vision_model()
+    timeout = _resolve_pi_vision_check_timeout()
+    last_error: Optional[Exception] = None
+
+    for endpoint in _pi_vision_endpoint_candidates():
+        try:
+            tags_url = _pi_vision_api_url(endpoint, "tags")
+            show_url = _pi_vision_api_url(endpoint, "show")
+            with httpx.Client(timeout=timeout) as client:
+                tags_response = client.get(tags_url)
+                tags_response.raise_for_status()
+                tags_data = tags_response.json()
+
+                if _pi_vision_tags_include_model(tags_data, model):
+                    return True
+
+                # If tags is reachable but the model name was not listed,
+                # ask Ollama directly.  Some older/custom Ollama builds return
+                # sparse tag data, while /api/show gives a definitive answer.
+                show_response = client.post(show_url, json={"model": model})
+                if show_response.status_code == 404:
+                    logger.debug(
+                        "Pi vision model %r is not installed at %s", model, endpoint
+                    )
+                    continue
+                show_response.raise_for_status()
+                show_data = show_response.json()
+                if isinstance(show_data, dict) and show_data.get("error"):
+                    raise RuntimeError(str(show_data.get("error")))
+                return True
+        except Exception as exc:
+            last_error = exc
+            logger.debug("Pi vision requirement check failed (%s): %s", endpoint, exc)
+
+    if last_error is not None:
+        logger.debug("Pi vision unavailable: %s", last_error)
+    return False
+
+
+def _strip_data_url_prefix(image_data_url: str) -> str:
+    """Return raw base64 payload expected by Ollama's /api/generate images[]."""
+    if "," in image_data_url and image_data_url.lower().startswith("data:"):
+        return image_data_url.split(",", 1)[1]
+    return image_data_url
+
+
+def _clean_pi_vision_text(text: str) -> str:
+    """Normalize common Moondream/Ollama response artifacts."""
+    cleaned = (text or "").strip()
+    # The Ollama moondream template sometimes echoes this image sentinel.
+    if cleaned.startswith("!!!IMAGE!!!"):
+        cleaned = cleaned[len("!!!IMAGE!!!"):].strip()
+    return cleaned
+
+
+async def _post_pi_vision_generate(payload: Dict[str, Any], timeout: float) -> tuple[Dict[str, Any], str]:
+    """POST to Pi's Ollama generate endpoint, trying localhost fallbacks."""
+    last_error: Optional[Exception] = None
+    endpoints = _pi_vision_endpoint_candidates()
+    for endpoint in endpoints:
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(endpoint, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                if not isinstance(data, dict):
+                    raise ValueError(f"Unexpected Pi vision response type: {type(data).__name__}")
+                if data.get("error"):
+                    raise RuntimeError(str(data.get("error")))
+                return data, endpoint
+        except Exception as exc:
+            last_error = exc
+            logger.debug("Pi vision endpoint failed (%s): %s", endpoint, exc)
+    raise RuntimeError(
+        "Pi vision delegation failed for all endpoints "
+        f"({', '.join(endpoints)}): {last_error}"
+    )
+
+
+async def _vision_analyze_pi(
+    image_url: str,
+    prompt: str,
+    model: Optional[str] = None,
+) -> str:
+    """Analyze an image by delegating to Pi's local Moondream/Ollama server.
+
+    This avoids the auxiliary cloud vision providers entirely.  Ollama's
+    /api/generate endpoint expects raw base64 in images[], not a data: URL.
+    """
+    if not isinstance(prompt, str):
+        prompt = str(prompt) if prompt is not None else ""
+
+    debug_call_data = {
+        "parameters": {
+            "image_url": image_url,
+            "prompt": prompt[:200] + "..." if len(prompt) > 200 else prompt,
+            "model": model or _resolve_pi_vision_model(),
+            "endpoint": _pi_vision_endpoint_candidates()[0],
+        },
+        "error": None,
+        "success": False,
+        "analysis_length": 0,
+        "image_size_bytes": 0,
+    }
+
+    temp_image_path: Optional[Path] = None
+    should_cleanup = False
+
+    try:
+        from tools.interrupt import is_interrupted
+        if is_interrupted():
+            return json.dumps({
+                "success": False,
+                "error": "Interrupted",
+                "analysis": "Interrupted",
+            }, indent=2, ensure_ascii=False)
+
+        if not isinstance(image_url, str) or not image_url.strip():
+            raise ValueError("image_url is required")
+
+        image_source = image_url.strip()
+        logger.info("vision_analyze: delegating to Pi Moondream for %s", image_source[:80])
+
+        # Data URLs can be passed straight through after basic validation.
+        if image_source.lower().startswith("data:image/"):
+            if ";base64," not in image_source.lower():
+                raise ValueError("Only base64 image data URLs are supported")
+            raw_base64 = _strip_data_url_prefix(image_source)
+            image_size_bytes = (len(raw_base64) * 3) // 4
+            if len(image_source) > _MAX_BASE64_BYTES:
+                raise ValueError(
+                    f"Image too large for vision API: base64 payload is "
+                    f"{len(image_source) / (1024 * 1024):.1f} MB "
+                    f"(limit {_MAX_BASE64_BYTES / (1024 * 1024):.0f} MB)."
+                )
+        else:
+            # Resolve local files and remote URLs the same way the legacy aux
+            # path did, preserving SSRF and website-policy protections.
+            resolved_url = image_source
+            if resolved_url.startswith("file://"):
+                resolved_url = resolved_url[len("file://"):]
+            local_path = Path(os.path.expanduser(resolved_url))
+
+            if local_path.is_file():
+                temp_image_path = local_path
+                should_cleanup = False
+            elif await _validate_image_url_async(image_source):
+                blocked = check_website_access(image_source)
+                if blocked:
+                    raise PermissionError(blocked["message"])
+                temp_dir = get_hermes_dir("cache/vision", "temp_vision_images")
+                temp_image_path = temp_dir / f"temp_image_{uuid.uuid4()}.jpg"
+                await _download_image(image_source, temp_image_path)
+                should_cleanup = True
+            else:
+                raise ValueError(
+                    "Invalid image source. Provide an HTTP/HTTPS URL, data URL, "
+                    "or a valid local file path."
+                )
+
+            image_size_bytes = temp_image_path.stat().st_size
+            detected_mime_type = _detect_image_mime_type(temp_image_path)
+            if not detected_mime_type:
+                raise ValueError("Only real image files are supported for vision analysis.")
+
+            image_data_url = _image_to_base64_data_url(
+                temp_image_path, mime_type=detected_mime_type,
+            )
+            if len(image_data_url) > _MAX_BASE64_BYTES:
+                image_data_url = _resize_image_for_vision(
+                    temp_image_path, mime_type=detected_mime_type,
+                )
+                if len(image_data_url) > _MAX_BASE64_BYTES:
+                    raise ValueError(
+                        f"Image too large for vision API: base64 payload is "
+                        f"{len(image_data_url) / (1024 * 1024):.1f} MB "
+                        f"(limit {_MAX_BASE64_BYTES / (1024 * 1024):.0f} MB) "
+                        f"even after resizing."
+                    )
+            raw_base64 = _strip_data_url_prefix(image_data_url)
+
+        debug_call_data["image_size_bytes"] = image_size_bytes
+
+        pi_model = model or _resolve_pi_vision_model()
+        payload = {
+            "model": pi_model,
+            "prompt": prompt,
+            "images": [raw_base64],
+            "stream": False,
+            "options": {
+                "temperature": 0.1,
+            },
+        }
+
+        data, endpoint = await _post_pi_vision_generate(
+            payload, timeout=_resolve_pi_vision_timeout(),
+        )
+        analysis = _clean_pi_vision_text(str(data.get("response") or ""))
+        analysis_length = len(analysis)
+
+        result = {
+            "success": True,
+            "analysis": analysis or "Moondream returned an empty analysis for the image.",
+            "model": pi_model,
+            "provider": "pi/moondream",
+            "endpoint": endpoint,
+        }
+
+        debug_call_data["success"] = True
+        debug_call_data["analysis_length"] = analysis_length
+        debug_call_data["model_used"] = pi_model
+        debug_call_data["endpoint_used"] = endpoint
+        _debug.log_call("vision_analyze_pi", debug_call_data)
+        _debug.save()
+
+        return json.dumps(result, indent=2, ensure_ascii=False)
+
+    except Exception as exc:
+        error_msg = f"Error analyzing image with Pi Moondream: {exc}"
+        logger.error("%s", error_msg, exc_info=True)
+        result = {
+            "success": False,
+            "error": error_msg,
+            "analysis": (
+                "There was a problem delegating the image to Pi's Moondream "
+                f"vision server. Error: {exc}"
+            ),
+        }
+        debug_call_data["error"] = error_msg
+        _debug.log_call("vision_analyze_pi", debug_call_data)
+        _debug.save()
+        return json.dumps(result, indent=2, ensure_ascii=False)
+
+    finally:
+        if should_cleanup and temp_image_path and temp_image_path.exists():
+            try:
+                temp_image_path.unlink()
+            except Exception as cleanup_error:
+                logger.warning(
+                    "Could not delete temporary Pi vision file: %s",
+                    cleanup_error,
+                    exc_info=True,
+                )
+
+
 async def vision_analyze_tool(
     image_url: str,
     user_prompt: str,
@@ -1077,6 +1438,11 @@ async def vision_analyze_tool(
                 )
 
 
+def check_vision_analyze_requirements() -> bool:
+    """True when Pi Moondream OR auxiliary cloud vision is available."""
+    return check_pi_vision_requirements() or check_vision_requirements()
+
+
 def check_vision_requirements() -> bool:
     """Check if the configured runtime vision path can resolve a client.
 
@@ -1111,15 +1477,15 @@ if __name__ == "__main__":
     print("👁️ Vision Tools Module")
     print("=" * 40)
     
-    # Check if vision model is available
-    api_available = check_vision_requirements()
+    # Check if Pi/Moondream is available for the registered vision tool.
+    api_available = check_pi_vision_requirements()
     
     if not api_available:
-        print("❌ No auxiliary vision model available")
-        print("Configure a supported multimodal backend (OpenRouter, Nous, Codex, Anthropic, or a custom OpenAI-compatible endpoint).")
+        print("❌ Pi-hosted Moondream is not reachable")
+        print("Ensure Ollama is running with the moondream model at http://192.168.5.196:11434 (or set HERMES_PI_VISION_ENDPOINT).")
         sys.exit(1)
     else:
-        print("✅ Vision model available")
+        print("✅ Pi-hosted Moondream available")
     
     print("🛠️ Vision tools ready for use!")
     
@@ -1164,14 +1530,11 @@ from tools.registry import registry, tool_error
 VISION_ANALYZE_SCHEMA = {
     "name": "vision_analyze",
     "description": (
-        "Load an image into the conversation so you can see it. Accepts a "
-        "URL, local file path, or data URL. When your active model has "
-        "native vision, the image is attached to your context directly "
-        "and you read the pixels yourself on the next turn — call this "
-        "any time the user references an image (filepath in their message, "
-        "URL in tool output, screenshot from the browser, etc.). For "
-        "non-vision models, falls back to an auxiliary vision model that "
-        "returns a text description."
+        "Analyze an image using Pi-hosted Moondream vision. Accepts a URL, "
+        "local file path, or data URL. Call this any time the user references "
+        "an image (filepath in their message, URL in tool output, screenshot "
+        "from the browser, etc.). The tool delegates to Pi's local Ollama "
+        "generate API instead of auxiliary cloud vision providers."
     ),
     "parameters": {
         "type": "object",
@@ -1190,27 +1553,20 @@ VISION_ANALYZE_SCHEMA = {
 }
 
 
-def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
+async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
     image_url = args.get("image_url", "")
     question = args.get("question", "")
 
-    # Fast path: when native image routing is in effect for the active main
-    # model (provider accepts images in tool results, or the user set the
-    # model.supports_vision override), short-circuit the auxiliary LLM and
-    # return the image bytes as a multimodal tool-result envelope. The main
-    # model sees the pixels directly on its next turn — no aux call, no
-    # information loss, no extra latency.
-    if _should_use_native_vision_fast_path():
-        logger.info("vision_analyze: native fast path")
-        return _vision_analyze_native(image_url, question)
-
-    # Legacy path: aux LLM describes the image and we return its text.
     full_prompt = (
         "Fully describe and explain everything about this image, then answer the "
         f"following question:\n\n{question}"
     )
-    model = os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
-    return vision_analyze_tool(image_url, full_prompt, model)
+
+    if check_pi_vision_requirements():
+        model = os.getenv("HERMES_PI_VISION_MODEL", "").strip() or None
+        return await _vision_analyze_pi(image_url, full_prompt, model)
+
+    return await vision_analyze_tool(image_url, full_prompt, model=None)
 
 
 registry.register(
@@ -1218,7 +1574,7 @@ registry.register(
     toolset="vision",
     schema=VISION_ANALYZE_SCHEMA,
     handler=_handle_vision_analyze,
-    check_fn=check_vision_requirements,
+    check_fn=check_vision_analyze_requirements,
     is_async=True,
     emoji="👁️",
 )

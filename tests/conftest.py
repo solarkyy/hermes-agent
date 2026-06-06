@@ -198,6 +198,12 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_BACKGROUND_NOTIFICATIONS",
     "HERMES_EXEC_ASK",
     "HERMES_HOME_MODE",
+    "HERMES_DELEGATION_PI_MODE",
+    "HERMES_PI_SSH_HOST",
+    "HERMES_PI_OMNIOS_ROOT",
+    "HERMES_PI_SISTER_SPAWN",
+    "HERMES_PI_WORKER_MODEL",
+    "HERMES_PI_DELEGATE_LANE",
     "HERMES_AGENT_USE_LEGACY_SESSION_KEYS",
     # Kanban path/board pins must never leak from a developer shell or
     # dispatched worker into tests; otherwise tests can write fake tasks to
