@@ -170,7 +170,15 @@ class DirectAlias(NamedTuple):
 
 
 # Built-in direct aliases (can be extended via config.yaml model_aliases:)
-_BUILTIN_DIRECT_ALIASES: dict[str, DirectAlias] = {}
+_BUILTIN_DIRECT_ALIASES: dict[str, DirectAlias] = {
+    # Native Anthropic short aliases. Keep these exact-version aliases small and
+    # explicit so shorthand like ``sonnet-4.6`` does not drift to the newest
+    # Claude family member when users need a specific model contract.
+    "sonnet-4.6": DirectAlias("claude-sonnet-4-6", "anthropic", ""),
+    "opus-4.6": DirectAlias("claude-opus-4-6", "anthropic", ""),
+    "opus4.8": DirectAlias("claude-opus-4-8", "anthropic", ""),
+    "opus-4.8": DirectAlias("claude-opus-4-8", "anthropic", ""),
+}
 
 # Merged dict (builtins + user config); populated by _load_direct_aliases()
 DIRECT_ALIASES: dict[str, DirectAlias] = {}

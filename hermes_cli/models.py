@@ -322,15 +322,12 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "MiniMax-M2",
     ],
     "anthropic": [
-        "claude-opus-4-8",
-        "claude-opus-4-7",
-        "claude-opus-4-6",
+        # Claude subscription/OAuth picks: keep the native Anthropic picker
+        # intentionally small so /login users do not drift onto older or
+        # higher-risk IDs by accident.
         "claude-sonnet-4-6",
-        "claude-opus-4-5-20251101",
-        "claude-sonnet-4-5-20250929",
-        "claude-opus-4-20250514",
-        "claude-sonnet-4-20250514",
-        "claude-haiku-4-5-20251001",
+        "claude-opus-4-6",
+        "claude-opus-4-8",
     ],
     "deepseek": [
         "deepseek-v4-pro",

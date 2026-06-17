@@ -1811,6 +1811,31 @@ def test_dump_api_request_debug_uses_chat_completions_url(monkeypatch, tmp_path)
     assert payload["request"]["url"] == "http://127.0.0.1:9208/v1/chat/completions"
 
 
+def test_dump_api_request_debug_redacts_oauth_code_fragments(monkeypatch, tmp_path):
+    """Request dumps must not preserve pasted OAuth code#state fragments."""
+    _patch_agent_bootstrap(monkeypatch)
+    agent = run_agent.AIAgent(
+        model="gpt-4o",
+        base_url="http://127.0.0.1:9208/v1",
+        api_key="test-key",
+        quiet_mode=True,
+        max_iterations=1,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent.logs_dir = tmp_path
+    opaque_code = "a" * 40 + "#" + "b" * 24
+
+    dump_file = agent._dump_api_request_debug(
+        {"model": "gpt-4o", "messages": [{"role": "user", "content": opaque_code}]},
+        reason="preflight",
+    )
+
+    text = dump_file.read_text()
+    assert opaque_code not in text
+    assert "[REDACTED_OAUTH_CODE]" in text
+
+
 # --- Reasoning-only response tests (fix for empty content retry loop) ---
 
 
