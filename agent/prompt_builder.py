@@ -129,6 +129,17 @@ DEFAULT_AGENT_IDENTITY = (
     "Be targeted and efficient in your exploration and investigations."
 )
 
+HERMES_BUDGET_LAW_PROMPT = (
+    "# Hermes Budget Law\n"
+    "Context budgeting is an assembly discipline, not a memory cap. Sacred "
+    "continuity and identity come first in the model-visible prompt. Budget "
+    "modes are intent signals, not authority to forget: they must not silently "
+    "delete memory, cap continuity, drop identity law, filter tools, or alter "
+    "provenance obligations. Deferred or compacted context must be named in "
+    "receipts or diagnostics, and until enforcement is implemented Hermes must "
+    "state pruning=none, tool_filtering=none, and enforcement=none."
+)
+
 HERMES_AGENT_HELP_GUIDANCE = (
     "You run on Hermes Agent (by Nous Research). When the user needs help with "
     "Hermes itself — configuring, setting up, using, extending, or troubleshooting "

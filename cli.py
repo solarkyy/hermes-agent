@@ -3086,6 +3086,7 @@ class HermesCLI:
         max_turns: int = None,
         verbose: Optional[bool] = None,
         compact: bool = False,
+        hermes_mode: str = None,
         resume: str = None,
         checkpoints: bool = False,
         pass_session_id: bool = False,
@@ -3103,12 +3104,15 @@ class HermesCLI:
             max_turns: Maximum tool-calling iterations shared with subagents (default: 90)
             verbose: Enable verbose logging
             compact: Use compact display mode
+            hermes_mode: Context-budget mode label (lean, normal, deep); warn-only
             resume: Session ID to resume (restores conversation history from SQLite)
             pass_session_id: Include the session ID in the agent's system prompt
         """
         # Initialize Rich console
         self.console = Console()
         self.config = CLI_CONFIG
+        from hermes_cli.context_budget import normalize_mode
+        self.hermes_mode = normalize_mode(hermes_mode)
         self.compact = compact if compact is not None else CLI_CONFIG["display"].get("compact", False)
         # tool_progress: "off", "new", "all", "verbose" (from config.yaml display section)
         # YAML 1.1 parses bare `off` as boolean False — normalise to string.
@@ -3408,6 +3412,9 @@ class HermesCLI:
         # not the background process_loop thread.
         self._pending_relaunch: list[str] | None = None
         self._last_ctrl_c_time = 0
+        self._context_budget_banner_shown = False
+        self._last_context_budget_snapshot = None
+        self._context_budget_warnings = []
         self._clarify_state = None
         self._clarify_freetext = False
         self._clarify_deadline = 0
@@ -5224,6 +5231,7 @@ class HermesCLI:
                 runtime.get("command"),
                 tuple(runtime.get("args") or ()),
             )
+            self._write_context_budget_receipt(phase="agent_initialized")
 
             # Force-create DB row on /title intent, then apply title.
             if self._pending_title and self._session_db and self.agent:
@@ -5349,6 +5357,8 @@ class HermesCLI:
                 "[dim]   Switch with: /model sonnet  or  /model gpt5[/]"
             )
 
+        self._console_print()
+        self._print_context_budget_banner()
         self._console_print()
 
     def _restore_session_cwd(self, session_meta: dict, *, quiet: bool = False) -> None:
@@ -6184,6 +6194,67 @@ class HermesCLI:
             f"[dim {separator_color}]·[/] [bold {label_color}]{tool_status}[/]"
             f"{toolsets_info}{provider_info}"
         )
+
+    def _context_budget_tool_count(self) -> int:
+        agent = getattr(self, "agent", None)
+        if agent is not None and getattr(agent, "tools", None) is not None:
+            return len(agent.tools or [])
+        if os.environ.get("HERMES_DEFER_AGENT_STARTUP") == "1":
+            return 0
+        try:
+            tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
+            return len(tools or [])
+        except Exception:
+            return 0
+
+    def _build_context_budget_snapshot(self, *, phase: str = "session_start") -> dict:
+        from hermes_cli.context_budget import build_context_budget_snapshot
+
+        agent = getattr(self, "agent", None)
+        compressor = getattr(agent, "context_compressor", None) if agent is not None else None
+        return build_context_budget_snapshot(
+            session_id=getattr(self, "session_id", None),
+            mode=getattr(self, "hermes_mode", None),
+            provider=(getattr(agent, "provider", None) if agent is not None else None) or getattr(self, "provider", None),
+            model=(getattr(agent, "model", None) if agent is not None else None) or getattr(self, "model", None),
+            toolsets=getattr(self, "enabled_toolsets", None),
+            tool_count=self._context_budget_tool_count(),
+            context_length=getattr(compressor, "context_length", None) if compressor is not None else None,
+            last_prompt_tokens=getattr(compressor, "last_prompt_tokens", None) if compressor is not None else None,
+            cached_prefix_tokens=getattr(agent, "session_cache_read_tokens", 0) if agent is not None else 0,
+            system_prompt=(getattr(agent, "_cached_system_prompt", None) if agent is not None else None) or getattr(self, "system_prompt", None),
+            ignore_rules=bool(getattr(self, "ignore_rules", False)),
+            memory_enabled=getattr(agent, "_memory_enabled", None) if agent is not None else None,
+            memory_provider_enabled=bool(getattr(agent, "_memory_manager", None)) if agent is not None else None,
+            api_calls=getattr(agent, "session_api_calls", 0) if agent is not None else 0,
+            warnings=getattr(self, "_context_budget_warnings", []),
+            phase=phase,
+        )
+
+    def _write_context_budget_receipt(self, *, phase: str = "session_start") -> dict:
+        from hermes_cli.context_budget import write_context_budget_receipt
+
+        snapshot = self._build_context_budget_snapshot(phase=phase)
+        write_context_budget_receipt(snapshot)
+        self._last_context_budget_snapshot = snapshot
+        return snapshot
+
+    def _print_context_budget_banner(self, *, force: bool = False) -> None:
+        if self._context_budget_banner_shown and not force:
+            return
+        from hermes_cli.context_budget import format_startup_banner
+
+        snapshot = self._write_context_budget_receipt(phase="startup_banner")
+        self._context_budget_banner_shown = True
+        self._console_print("[bold #FFBF00]Hermes Context Budget[/]")
+        for line in format_startup_banner(snapshot):
+            self._console_print(f"  {line}", markup=False, highlight=False)
+        if snapshot.get("mode") == "deep" and not snapshot.get("route", {}).get("deep_confirmed"):
+            self._console_print(
+                "  Deep mode selected; no enforcement applied at this gate.",
+                markup=False,
+                highlight=False,
+            )
 
     def _show_session_status(self):
         """Show gateway-style status for the current CLI session."""
@@ -10535,8 +10606,13 @@ class HermesCLI:
         return True
 
     def _show_usage(self):
-        """Show rate limits (if available) and session token usage."""
+        """Show rate limits (if available) and session token/context-budget usage."""
+        from hermes_cli.context_budget import format_usage_budget_lines
+
         if not self.agent:
+            snapshot = self._write_context_budget_receipt(phase="usage_no_agent")
+            for line in format_usage_budget_lines(snapshot):
+                print(line)
             print("(._.) No active agent -- send a message first.")
             return
 
@@ -10544,6 +10620,9 @@ class HermesCLI:
         calls = agent.session_api_calls
 
         if calls == 0:
+            snapshot = self._write_context_budget_receipt(phase="usage_no_api_calls")
+            for line in format_usage_budget_lines(snapshot):
+                print(line)
             print("(._.) No API calls made yet in this session.")
             return
 
@@ -10614,6 +10693,10 @@ class HermesCLI:
         print(f"  Compressions:     {compressions}")
         if cost_result.status == "unknown":
             print(f"  Note:             Pricing unknown for {agent.model}")
+
+        snapshot = self._write_context_budget_receipt(phase="usage")
+        for line in format_usage_budget_lines(snapshot):
+            print(line)
 
         # Account limits -- fetched off-thread with a hard timeout so slow
         # provider APIs don't hang the prompt.
@@ -12433,6 +12516,13 @@ class HermesCLI:
         if isinstance(message, str):
             from run_agent import _sanitize_surrogates
             message = _sanitize_surrogates(message)
+            from hermes_cli.context_budget import detect_deep_work_warnings
+            warnings = detect_deep_work_warnings(message, getattr(self, "hermes_mode", None))
+            if warnings:
+                self._context_budget_warnings.extend(warnings)
+                if getattr(self, "tool_progress_mode", "") != "off":
+                    for warning in warnings:
+                        _cprint(f"  {_DIM}{warning.get('message', 'warning: deep-work signals detected; no enforcement applied')}{_RST}")
 
         # Add user message to history
         self.conversation_history.append({"role": "user", "content": message})
@@ -12738,6 +12828,8 @@ class HermesCLI:
                 self._transfer_session_yolo(self.session_id, self.agent.session_id)
                 self.session_id = self.agent.session_id
                 self._pending_title = None
+
+            self._write_context_budget_receipt(phase="turn_complete")
 
             # Get the final response
             response = result.get("final_response", "") if result else ""
@@ -15790,6 +15882,7 @@ def main(
     verbose: Optional[bool] = None,
     quiet: bool = False,
     compact: bool = False,
+    hermes_mode: str = None,
     list_tools: bool = False,
     list_toolsets: bool = False,
     gateway: bool = False,
@@ -15817,6 +15910,7 @@ def main(
         max_turns: Maximum tool-calling iterations (default: 60)
         verbose: Enable verbose logging
         compact: Use compact display mode
+        hermes_mode: Context-budget mode label (lean, normal, deep); warn-only
         list_tools: List available tools and exit
         list_toolsets: List available toolsets and exit
         resume: Resume a previous session by its ID (e.g., 20260225_143052_a1b2c3)
@@ -15915,6 +16009,7 @@ def main(
         max_turns=max_turns,
         verbose=verbose,
         compact=compact,
+        hermes_mode=hermes_mode,
         resume=resume,
         checkpoints=checkpoints,
         pass_session_id=pass_session_id,
@@ -16132,6 +16227,14 @@ def main(
                             single_query_images,
                             announce=False,
                         )
+                if isinstance(effective_query, str):
+                    try:
+                        from hermes_cli.context_budget import detect_deep_work_warnings
+                        cli._context_budget_warnings.extend(
+                            detect_deep_work_warnings(effective_query, getattr(cli, "hermes_mode", None))
+                        )
+                    except Exception:
+                        pass
                 turn_route = cli._resolve_turn_agent_config(effective_query)
                 if turn_route["signature"] != cli._active_agent_route_signature:
                     cli.agent = None
@@ -16165,6 +16268,7 @@ def main(
                         and cli.agent.session_id != cli.session_id
                     ):
                         cli.session_id = cli.agent.session_id
+                    cli._write_context_budget_receipt(phase="turn_complete")
                     response = result.get("final_response", "") if isinstance(result, dict) else str(result)
                     # Surface backend errors that produced no visible output
                     # (e.g. invalid model slug → provider 4xx). Mirrors the
@@ -16245,6 +16349,7 @@ def main(
             # Surface security advisories before the agent runs — short
             # banner, doesn't depend on the welcome banner being shown.
             cli._show_security_advisories()
+            cli._print_context_budget_banner()
             cli.chat(query, images=single_query_images or None)
             cli._print_exit_summary()
         return
