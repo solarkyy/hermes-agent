@@ -1837,19 +1837,22 @@ class HermesACPAgent(acp.Agent):
         context_length = int(getattr(compressor, "context_length", 0) or 0)
         threshold_tokens = int(getattr(compressor, "threshold_tokens", 0) or 0)
 
+        token_breakdown = {}
         try:
-            from agent.model_metadata import estimate_request_tokens_rough
+            from agent.model_metadata import estimate_request_token_breakdown_rough
 
             system_prompt = getattr(agent, "_cached_system_prompt", "") or ""
             tools = getattr(agent, "tools", None) or None
-            approx_tokens = estimate_request_tokens_rough(
+            token_breakdown = estimate_request_token_breakdown_rough(
                 state.history,
                 system_prompt=system_prompt,
                 tools=tools,
             )
+            approx_tokens = token_breakdown["total"]
         except Exception:
             logger.debug("Could not estimate ACP context usage", exc_info=True)
             approx_tokens = 0
+            token_breakdown = {}
 
         if threshold_tokens <= 0 and context_length > 0:
             threshold_tokens = int(context_length * 0.80)
@@ -1873,6 +1876,13 @@ class HermesACPAgent(acp.Agent):
                 )
             else:
                 lines.append(f"Context usage: ~{approx_tokens:,} tokens")
+            if token_breakdown:
+                lines.append(
+                    "Breakdown: "
+                    f"system ~{token_breakdown.get('system_prompt', 0):,}, "
+                    f"messages ~{token_breakdown.get('messages', 0):,}, "
+                    f"tools ~{token_breakdown.get('tools', 0):,}"
+                )
 
         if threshold_tokens > 0:
             if approx_tokens > 0:

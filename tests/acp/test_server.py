@@ -1508,14 +1508,22 @@ class TestSlashCommands:
         state.agent.tools = [{"type": "function", "function": {"name": "demo"}}]
 
         with patch(
-            "agent.model_metadata.estimate_request_tokens_rough",
-            return_value=25_000,
+            "agent.model_metadata.estimate_request_token_breakdown_rough",
+            return_value={
+                "system_prompt": 1_000,
+                "messages": 20_000,
+                "tools": 4_000,
+                "total": 25_000,
+            },
         ):
             result = agent._handle_slash_command("/context", state)
 
         assert "Context usage: ~25,000 / 100,000 tokens (25.0%)" in result
+        assert "Breakdown: system ~1,000, messages ~20,000, tools ~4,000" in result
         assert "Compression: ~55,000 tokens until threshold (~80,000, 80%)" in result
         assert "Tip: run /compact" in result
+        assert "hello" not in result
+        assert "demo" not in result
 
     def test_context_says_compression_due_when_past_threshold(self, agent, mock_manager):
         state = self._make_state(mock_manager)
@@ -1526,12 +1534,18 @@ class TestSlashCommands:
         )
 
         with patch(
-            "agent.model_metadata.estimate_request_tokens_rough",
-            return_value=82_000,
+            "agent.model_metadata.estimate_request_token_breakdown_rough",
+            return_value={
+                "system_prompt": 2_000,
+                "messages": 70_000,
+                "tools": 10_000,
+                "total": 82_000,
+            },
         ):
             result = agent._handle_slash_command("/context", state)
 
         assert "Context usage: ~82,000 / 100,000 tokens (82.0%)" in result
+        assert "Breakdown: system ~2,000, messages ~70,000, tools ~10,000" in result
         assert "Compression: due now (threshold ~80,000, 80%). Run /compact." in result
 
     def test_reset_clears_history(self, agent, mock_manager):

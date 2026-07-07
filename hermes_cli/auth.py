@@ -232,6 +232,15 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
     ),
+    "agy": ProviderConfig(
+        # Google Antigravity CLI (agy) - Gemini-CLI successor; execed via
+        # agent.agy_cli_client.AgyCliClient. Serves Gemini + Claude + GPT-OSS
+        # on the Antigravity-eligible tier (incl. Claude, which cloudcode-pa cannot reach).
+        id="agy",
+        name="Google Antigravity (agy CLI)",
+        auth_type="external_process",
+        inference_base_url="agy://antigravity",
+    ),
     "gemini": ProviderConfig(
         id="gemini",
         name="Google AI Studio",
@@ -1624,6 +1633,9 @@ def resolve_provider(
         "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
         "opencode": "opencode-zen", "zen": "opencode-zen",
         "qwen-portal": "qwen-oauth", "qwen-cli": "qwen-oauth", "qwen-oauth": "qwen-oauth",
+        "google-gemini-cli": "agy", "gemini-cli": "agy", "antigravity": "agy",
+        "google-antigravity": "agy", "gemini-oauth": "agy", "gemini-sub": "agy",
+        "gemini-subscription": "agy",
         "hf": "huggingface", "hugging-face": "huggingface", "huggingface-hub": "huggingface",
         "mimo": "xiaomi", "xiaomi-mimo": "xiaomi",
         "tencent": "tencent-tokenhub", "tokenhub": "tencent-tokenhub",
@@ -3168,7 +3180,7 @@ def _print_loopback_ssh_hint(redirect_uri: str, *, docs_url: str | None = None) 
 
 def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     """Read Codex OAuth tokens from Hermes auth store (~/.hermes/auth.json).
-    
+
     Returns dict with 'tokens' (access_token, refresh_token) and 'last_refresh'.
     Raises AuthError if no Codex tokens are stored.
     """
@@ -3499,7 +3511,7 @@ def _refresh_codex_auth_tokens(
     timeout_seconds: float,
 ) -> Dict[str, str]:
     """Refresh Codex access token using the refresh token.
-    
+
     Saves the new tokens to Hermes auth store automatically.
     """
     try:
@@ -3540,7 +3552,7 @@ def _refresh_codex_auth_tokens(
 
 def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
     """Try to read tokens from ~/.codex/auth.json (Codex CLI shared file).
-    
+
     Returns tokens dict if valid and not expired, None otherwise.
     Does NOT write to the shared file.
     """
@@ -6039,7 +6051,7 @@ def get_nous_session_validity() -> str:
 
 def get_codex_auth_status() -> Dict[str, Any]:
     """Status snapshot for Codex auth.
-    
+
     Checks the credential pool first (where `hermes auth` stores credentials),
     then falls back to the legacy provider state.
     """
@@ -6184,6 +6196,28 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
 
+    if provider_id == "agy":
+        command = (
+            os.getenv("HERMES_AGY_COMMAND", "").strip()
+            or os.getenv("AGY_CLI_PATH", "").strip()
+            or "agy"
+        )
+        raw_args = os.getenv("HERMES_AGY_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else []
+        base_url = pconfig.inference_base_url
+        resolved_command = shutil.which(command) if command else None
+        configured = bool(resolved_command or (command and os.path.exists(command)))
+        return {
+            "configured": configured,
+            "provider": provider_id,
+            "name": pconfig.name,
+            "command": command,
+            "args": args,
+            "resolved_command": resolved_command,
+            "base_url": base_url,
+            "logged_in": configured,
+        }
+
     command = (
         os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
         or os.getenv("COPILOT_CLI_PATH", "").strip()
@@ -6226,6 +6260,8 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
     if target == "minimax-oauth":
         return get_minimax_oauth_auth_status()
     if target == "copilot-acp":
+        return get_external_process_provider_status(target)
+    if target == "agy":
         return get_external_process_provider_status(target)
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
@@ -6403,6 +6439,32 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
             provider=provider_id,
             code="invalid_provider",
         )
+
+    if provider_id == "agy":
+        base_url = pconfig.inference_base_url
+        command = (
+            os.getenv("HERMES_AGY_COMMAND", "").strip()
+            or os.getenv("AGY_CLI_PATH", "").strip()
+            or "agy"
+        )
+        raw_args = os.getenv("HERMES_AGY_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else []
+        resolved_command = shutil.which(command) if command else None
+        if not resolved_command and not (command and os.path.exists(command)):
+            raise AuthError(
+                f"Could not find the Antigravity CLI command '{command}'. "
+                "Install agy or set HERMES_AGY_COMMAND/AGY_CLI_PATH.",
+                provider=provider_id,
+                code="missing_agy_cli",
+            )
+        return {
+            "provider": provider_id,
+            "api_key": "agy-external",
+            "base_url": base_url.rstrip("/"),
+            "command": resolved_command or command,
+            "args": args,
+            "source": "process",
+        }
 
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:

@@ -2424,11 +2424,33 @@ def estimate_request_tokens_rough(
     blind spot when only counting messages. Image content is counted
     at a flat per-image cost (see estimate_messages_tokens_rough).
     """
-    total = 0
-    if system_prompt:
-        total += (len(system_prompt) + 3) // 4
-    if messages:
-        total += estimate_messages_tokens_rough(messages)
-    if tools:
-        total += (len(str(tools)) + 3) // 4
-    return total
+    return estimate_request_token_breakdown_rough(
+        messages,
+        system_prompt=system_prompt,
+        tools=tools,
+    )["total"]
+
+
+def estimate_request_token_breakdown_rough(
+    messages: List[Dict[str, Any]],
+    *,
+    system_prompt: str = "",
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, int]:
+    """Rough token estimate split by full request payload bucket.
+
+    This intentionally mirrors ``estimate_request_tokens_rough`` exactly so
+    diagnostics can explain *why* a request is near compression without
+    changing compression decisions. Counts are aggregate only: no prompt,
+    message, or tool-schema content is returned.
+    """
+    system_prompt_tokens = estimate_tokens_rough(system_prompt) if system_prompt else 0
+    message_tokens = estimate_messages_tokens_rough(messages) if messages else 0
+    tool_tokens = estimate_tokens_rough(str(tools)) if tools else 0
+    total = system_prompt_tokens + message_tokens + tool_tokens
+    return {
+        "system_prompt": system_prompt_tokens,
+        "messages": message_tokens,
+        "tools": tool_tokens,
+        "total": total,
+    }

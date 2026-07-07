@@ -224,11 +224,18 @@ def auth_add_command(args) -> None:
     if provider == "anthropic":
         from agent import anthropic_adapter as anthropic_mod
 
-        creds = anthropic_mod.run_hermes_oauth_login_pure()
-        if not creds:
-            raise SystemExit("Anthropic OAuth login did not return credentials.")
+        # Same subscription lane as Pi: Claude Code setup-token → pi auth.json mirror.
+        token = anthropic_mod.run_oauth_setup_token()
+        if not token:
+            raise SystemExit(
+                "Anthropic subscription login failed. Run `pi /login` (anthropic) "
+                "or `claude setup-token`, then retry."
+            )
+        creds = anthropic_mod.read_claude_code_credentials()
+        if not creds or not creds.get("accessToken"):
+            raise SystemExit("Anthropic credentials not found after login.")
         label = (getattr(args, "label", None) or "").strip() or label_from_token(
-            creds["access_token"],
+            creds["accessToken"],
             _oauth_default_label(provider, len(pool.entries()) + 1),
         )
         entry = PooledCredential(
@@ -237,10 +244,10 @@ def auth_add_command(args) -> None:
             label=label,
             auth_type=AUTH_TYPE_OAUTH,
             priority=0,
-            source=f"{SOURCE_MANUAL}:hermes_pkce",
-            access_token=creds["access_token"],
-            refresh_token=creds.get("refresh_token"),
-            expires_at_ms=creds.get("expires_at_ms"),
+            source="claude_code",
+            access_token=creds["accessToken"],
+            refresh_token=creds.get("refreshToken"),
+            expires_at_ms=creds.get("expiresAt"),
             base_url=_provider_base_url(provider),
         )
         pool.add_entry(entry)

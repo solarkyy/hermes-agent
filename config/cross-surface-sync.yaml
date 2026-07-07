@@ -1,0 +1,5 @@
+ws_port: 8787
+ot_enabled: true
+ot_type: text
+heartbeat_interval_ms: 30000
+max_reconnect_attempts: 10

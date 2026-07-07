@@ -2349,6 +2349,9 @@ def cmd_chat(args):
 
     _pin_kanban_board_env()
 
+    if getattr(args, "hermes_mode", None):
+        os.environ["HERMES_MODE"] = args.hermes_mode
+
     if use_tui:
         _launch_tui(
             getattr(args, "resume", None),
@@ -2389,6 +2392,7 @@ def cmd_chat(args):
         "ignore_rules": getattr(args, "ignore_rules", False) or getattr(args, "safe_mode", False),
         "ignore_user_config": getattr(args, "ignore_user_config", False) or getattr(args, "safe_mode", False),
         "compact": getattr(args, "compact", False),
+        "hermes_mode": getattr(args, "hermes_mode", None),
     }
     # Filter out None values
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
@@ -12242,6 +12246,7 @@ _TOP_LEVEL_VALUE_FLAGS = frozenset(
         "-z", "--oneshot",
         "-m", "--model",
         "--provider",
+        "--hermes-mode",
         "-t", "--toolsets",
         "-r", "--resume",
         "-s", "--skills",
@@ -12422,6 +12427,7 @@ def _set_chat_arg_defaults(args) -> None:
         ("model", None),
         ("provider", None),
         ("toolsets", None),
+        ("hermes_mode", None),
         ("verbose", False),
         ("resume", None),
         ("continue_last", None),
@@ -12470,6 +12476,8 @@ def _try_termux_fast_cli_launch() -> bool:
         return True
 
     if getattr(args, "oneshot", None):
+        if getattr(args, "hermes_mode", None):
+            os.environ["HERMES_MODE"] = args.hermes_mode
         _prepare_agent_startup(args)
         from hermes_cli.oneshot import run_oneshot
 
@@ -14121,6 +14129,8 @@ def main():
     # Handle top-level --oneshot / -z: single-shot mode, stdout = final
     # response only, nothing else. Bypasses cli.py entirely.
     if getattr(args, "oneshot", None):
+        if getattr(args, "hermes_mode", None):
+            os.environ["HERMES_MODE"] = args.hermes_mode
         from hermes_cli.oneshot import run_oneshot
 
         sys.exit(
@@ -14141,6 +14151,7 @@ def main():
             ("model", None),
             ("provider", None),
             ("toolsets", None),
+            ("hermes_mode", None),
             ("verbose", None),
             ("worktree", False),
         ]:
@@ -14156,6 +14167,7 @@ def main():
             ("model", None),
             ("provider", None),
             ("toolsets", None),
+            ("hermes_mode", None),
             ("verbose", None),
             ("resume", None),
             ("continue_last", None),

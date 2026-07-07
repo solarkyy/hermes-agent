@@ -3638,18 +3638,18 @@ class TestAuxiliaryAuthRefreshRetry:
                 "expiresAt": 0,
             }),
             patch("agent.anthropic_adapter.refresh_anthropic_oauth_pure", return_value={
-                "access_token": "fresh-token",
+                "access_token": "sk-ant-oat01-fresh-token",
                 "refresh_token": "refresh-token-2",
                 "expires_at_ms": 9999999999999,
             }) as mock_refresh_oauth,
-            patch("agent.anthropic_adapter._write_claude_code_credentials") as mock_write,
+            patch("agent.anthropic_adapter._write_subscription_oauth_credentials") as mock_write,
         ):
             from agent.auxiliary_client import _refresh_provider_credentials
 
             assert _refresh_provider_credentials("anthropic") is True
 
-        mock_refresh_oauth.assert_called_once_with("refresh-token", use_json=False)
-        mock_write.assert_called_once_with("fresh-token", "refresh-token-2", 9999999999999)
+        mock_refresh_oauth.assert_called_once_with("refresh-token", use_json=True)
+        mock_write.assert_called_once_with("sk-ant-oat01-fresh-token", "refresh-token-2", 9999999999999, scopes=None)
         stale_client.close.assert_called_once()
 
     @pytest.mark.asyncio

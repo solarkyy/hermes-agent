@@ -649,7 +649,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                 return None
 
     config = load_config()
-    
+
     # First check providers: dict (new-style user-defined providers)
     providers = config.get("providers")
     if isinstance(providers, dict):
@@ -1840,6 +1840,22 @@ def resolve_runtime_provider(
             "api_mode": "chat_completions",
             "base_url": creds.get("base_url", "").rstrip("/"),
             "api_key": creds.get("api_key", ""),
+            "command": creds.get("command", ""),
+            "args": list(creds.get("args") or []),
+            "source": creds.get("source", "process"),
+            "requested_provider": requested_provider,
+        }
+
+    if provider == "agy":
+        # agy (Antigravity CLI) manages its own Google OAuth/subscription
+        # internally.  Resolve only the local executable details; no AI Studio
+        # API key or Hermes-managed Google token is required.
+        creds = resolve_external_process_provider_credentials(provider)
+        return {
+            "provider": "agy",
+            "api_mode": "chat_completions",
+            "base_url": creds.get("base_url", "agy://antigravity"),
+            "api_key": creds.get("api_key", "agy-external"),
             "command": creds.get("command", ""),
             "args": list(creds.get("args") or []),
             "source": creds.get("source", "process"),

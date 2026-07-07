@@ -609,28 +609,40 @@ class CredentialPool:
         if self.provider != "anthropic" or entry.source != "claude_code":
             return entry
         try:
-            from agent.anthropic_adapter import read_claude_code_credentials
+            from agent.anthropic_adapter import read_claude_code_credentials, is_claude_code_token_valid
             creds = read_claude_code_credentials()
             if not creds:
                 return entry
             file_refresh = creds.get("refreshToken", "")
             file_access = creds.get("accessToken", "")
             file_expires = creds.get("expiresAt", 0)
-            # Sync when either token changed.  Access tokens can be re-issued
-            # without a new refresh token (silent re-issue path), so checking
-            # only refresh_token misses that case and leaves a stale
-            # access_token in the pool → 401 on every request until the pool
-            # entry's exhausted TTL expires.
+            # Sync when tokens differ or the pool entry is empty/stale. Without
+            # this, an exhausted claude_code entry with no access_token never
+            # picks up the live Pi / Claude Code credentials on disk.
             entry_access = entry.access_token or ""
             entry_refresh = entry.refresh_token or ""
-            if (file_access or file_refresh) and (
+            tokens_changed = (
                 (file_access and file_access != entry_access)
                 or (file_refresh and file_refresh != entry_refresh)
-            ):
-                logger.debug(
-                    "Pool entry %s: syncing tokens from credentials file (tokens changed)",
-                    entry.id,
-                )
+                or (not entry_access and file_access)
+            )
+            creds_still_valid = bool(file_access) and is_claude_code_token_valid(creds)
+            should_clear_exhaustion = (
+                entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD}
+                and creds_still_valid
+                and tokens_changed
+            )
+            if tokens_changed or should_clear_exhaustion:
+                if should_clear_exhaustion and not tokens_changed:
+                    logger.info(
+                        "Pool entry %s: clearing stale exhaustion — live Claude Code OAuth creds still valid",
+                        entry.id,
+                    )
+                elif tokens_changed:
+                    logger.debug(
+                        "Pool entry %s: syncing tokens from Claude Code credentials",
+                        entry.id,
+                    )
                 updated = replace(
                     entry,
                     access_token=file_access or entry.access_token,
@@ -1734,31 +1746,40 @@ def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, p
     return False
 
 
+def _anthropic_source_rank(source: str) -> int:
+    """Unified priority rank for Anthropic pool entries.
+
+    Pi / Claude Code subscription OAuth (``claude_code``, seeded from
+    ``~/.pi/agent/auth.json``) must win over Hermes' separate PKCE logins.
+    Those PKCE tokens are a different OAuth chain and can hit different
+    billing gates even when the Claude Code subscription still has quota.
+    """
+    normalized = (source or "").strip().lower()
+    if normalized == "claude_code":
+        return 0
+    if normalized in {"env:anthropic_token", "env:claude_code_oauth_token"}:
+        return 1
+    if normalized in {"hermes_pkce", "manual:hermes_pkce", "manual:dashboard_pkce"}:
+        return 99  # deprecated extra-usage OAuth — never prefer over claude_code
+    if normalized == "env:anthropic_api_key":
+        return 6
+    if _is_manual_source(normalized):
+        return 4
+    return 3
+
+
 def _normalize_pool_priorities(provider: str, entries: List[PooledCredential]) -> bool:
     if provider != "anthropic":
         return False
 
-    source_rank = {
-        "env:ANTHROPIC_TOKEN": 0,
-        "env:CLAUDE_CODE_OAUTH_TOKEN": 1,
-        "hermes_pkce": 2,
-        "claude_code": 3,
-        "env:ANTHROPIC_API_KEY": 4,
-    }
-    manual_entries = sorted(
-        (entry for entry in entries if _is_manual_source(entry.source)),
-        key=lambda entry: entry.priority,
-    )
-    seeded_entries = sorted(
-        (entry for entry in entries if not _is_manual_source(entry.source)),
+    ordered = sorted(
+        entries,
         key=lambda entry: (
-            source_rank.get(entry.source, len(source_rank)),
+            _anthropic_source_rank(entry.source),
             entry.priority,
             entry.label,
         ),
     )
-
-    ordered = [*manual_entries, *seeded_entries]
     id_to_idx = {entry.id: idx for idx, entry in enumerate(entries)}
     changed = False
     for new_priority, entry in enumerate(ordered):
@@ -1837,27 +1858,54 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
 
         from agent.anthropic_adapter import read_claude_code_credentials, read_hermes_oauth_credentials
 
-        for source_name, creds in (
-            ("hermes_pkce", read_hermes_oauth_credentials()),
-            ("claude_code", read_claude_code_credentials()),
-        ):
-            if creds and creds.get("accessToken"):
-                if _is_suppressed(provider, source_name):
-                    continue
-                active_sources.add(source_name)
+        subscription_creds = read_claude_code_credentials()
+        if subscription_creds and subscription_creds.get("accessToken"):
+            if not _is_suppressed(provider, "claude_code"):
+                active_sources.add("claude_code")
                 changed |= _upsert_entry(
                     entries,
                     provider,
-                    source_name,
+                    "claude_code",
                     {
-                        "source": source_name,
+                        "source": "claude_code",
                         "auth_type": AUTH_TYPE_OAUTH,
-                        "access_token": creds.get("accessToken", ""),
-                        "refresh_token": creds.get("refreshToken"),
-                        "expires_at_ms": creds.get("expiresAt"),
-                        "label": label_from_token(creds.get("accessToken", ""), source_name),
+                        "access_token": subscription_creds.get("accessToken", ""),
+                        "refresh_token": subscription_creds.get("refreshToken"),
+                        "expires_at_ms": subscription_creds.get("expiresAt"),
+                        "label": label_from_token(
+                            subscription_creds.get("accessToken", ""),
+                            "claude_code",
+                        ),
                     },
                 )
+        # Hermes-native PKCE OAuth (``~/.hermes/.anthropic_oauth.json``) bills
+        # against Anthropic's subscription *extra usage* pool. Do not auto-seed
+        # it when Claude Code / Pi subscription credentials exist; otherwise keep
+        # the upstream fallback for users who explicitly logged into Hermes PKCE.
+        hermes_creds = read_hermes_oauth_credentials()
+        if (
+            not (subscription_creds and subscription_creds.get("accessToken"))
+            and hermes_creds
+            and hermes_creds.get("accessToken")
+            and not _is_suppressed(provider, "hermes_pkce")
+        ):
+            active_sources.add("hermes_pkce")
+            changed |= _upsert_entry(
+                entries,
+                provider,
+                "hermes_pkce",
+                {
+                    "source": "hermes_pkce",
+                    "auth_type": AUTH_TYPE_OAUTH,
+                    "access_token": hermes_creds.get("accessToken", ""),
+                    "refresh_token": hermes_creds.get("refreshToken"),
+                    "expires_at_ms": hermes_creds.get("expiresAt"),
+                    "label": label_from_token(
+                        hermes_creds.get("accessToken", ""),
+                        "hermes_pkce",
+                    ),
+                },
+            )
 
     elif provider == "nous":
         state = _load_provider_state(auth_store, "nous")
@@ -2231,6 +2279,25 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     return changed, active_sources
 
 
+def _prune_anthropic_extra_usage_oauth_entries(
+    entries: List[PooledCredential],
+    active_sources: Set[str],
+) -> bool:
+    """Drop Hermes PKCE OAuth entries when Claude Code subscription OAuth is live."""
+    if "claude_code" not in active_sources:
+        return False
+    from agent.anthropic_adapter import ANTHROPIC_EXTRA_USAGE_OAUTH_SOURCES
+
+    retained = [
+        entry for entry in entries
+        if entry.source not in ANTHROPIC_EXTRA_USAGE_OAUTH_SOURCES
+    ]
+    if len(retained) == len(entries):
+        return False
+    entries[:] = retained
+    return True
+
+
 def _prune_stale_seeded_entries(
     entries: List[PooledCredential],
     active_sources: Set[str],
@@ -2252,7 +2319,6 @@ def _prune_stale_seeded_entries(
             is_borrowed_credential_source(entry.source, entry.provider)
             or entry.source == "hermes_pkce"
         )
-
     retained = [
         entry
         for entry in entries
@@ -2372,6 +2438,10 @@ def load_pool(provider: str) -> CredentialPool:
             singleton_sources | env_sources,
             prune_env_sources=False,
         )
+        if provider == "anthropic":
+            changed |= _prune_anthropic_extra_usage_oauth_entries(
+                entries, singleton_sources | env_sources,
+            )
         changed |= _normalize_pool_priorities(provider, entries)
 
     if changed:

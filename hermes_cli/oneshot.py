@@ -160,6 +160,12 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
         pass
 
 
+def _looks_like_agent_failure_response(response: str) -> bool:
+    """Detect AIAgent's synthesized provider-failure text in oneshot mode."""
+    text = (response or "").lstrip()
+    return text.startswith("API call failed after ")
+
+
 def run_oneshot(
     prompt: str,
     model: Optional[str] = None,
@@ -226,13 +232,19 @@ def run_oneshot(
     try:
         with redirect_stdout(devnull), redirect_stderr(devnull):
             try:
-                response, result = _run_agent(
+                run_result = _run_agent(
                     prompt,
                     model=model,
                     provider=provider,
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
                 )
+                if isinstance(run_result, tuple) and len(run_result) == 2:
+                    response, result = run_result
+                else:
+                    # Backward-compatible with tests/callers that monkeypatch
+                    # _run_agent to return only the final response string.
+                    response, result = str(run_result or ""), {}
             except BaseException as exc:  # noqa: BLE001
                 # Capture anything that escapes the agent (including OSError
                 # from prompt_toolkit/Vt100 when stdout is a non-TTY pipe,
@@ -261,12 +273,6 @@ def run_oneshot(
 
     _write_usage_file(usage_file, result)
 
-    if response:
-        real_stdout.write(response)
-        if not response.endswith("\n"):
-            real_stdout.write("\n")
-        real_stdout.flush()
-
     if (result.get("failed") or result.get("partial")) and not (response or "").strip():
         return 2
 
@@ -275,6 +281,18 @@ def run_oneshot(
         real_stderr.flush()
         return 1
 
+    assert response is not None  # narrowed by the empty-response guard above
+    if _looks_like_agent_failure_response(response):
+        real_stderr.write(response)
+        if not response.endswith("\n"):
+            real_stderr.write("\n")
+        real_stderr.flush()
+        return 1
+
+    real_stdout.write(response)
+    if not response.endswith("\n"):
+        real_stdout.write("\n")
+    real_stdout.flush()
     return 0
 
 
@@ -417,6 +435,35 @@ def _run_agent(
     agent.tool_gen_callback = None
 
     result = agent.run_conversation(prompt)
+    try:
+        from hermes_cli.context_budget import (
+            build_context_budget_snapshot,
+            detect_deep_work_warnings,
+            write_context_budget_receipt,
+        )
+
+        compressor = getattr(agent, "context_compressor", None)
+        _mode = os.getenv("HERMES_MODE") or os.getenv("HERMES_CONTEXT_MODE")
+        snapshot = build_context_budget_snapshot(
+            session_id=getattr(agent, "session_id", None),
+            mode=_mode,
+            provider=getattr(agent, "provider", None),
+            model=getattr(agent, "model", None),
+            toolsets=toolsets_list,
+            tool_count=len(getattr(agent, "tools", None) or []),
+            context_length=getattr(compressor, "context_length", None) if compressor is not None else None,
+            last_prompt_tokens=getattr(compressor, "last_prompt_tokens", None) if compressor is not None else None,
+            cached_prefix_tokens=getattr(agent, "session_cache_read_tokens", 0),
+            system_prompt=getattr(agent, "_cached_system_prompt", None),
+            memory_enabled=getattr(agent, "_memory_enabled", None),
+            memory_provider_enabled=bool(getattr(agent, "_memory_manager", None)),
+            api_calls=getattr(agent, "session_api_calls", 0),
+            warnings=detect_deep_work_warnings(prompt, _mode),
+            phase="oneshot_complete",
+        )
+        write_context_budget_receipt(snapshot)
+    except Exception:
+        pass
     return (result.get("final_response") or "", result)
 
 

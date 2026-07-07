@@ -94,6 +94,15 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         base_url_override="acp://copilot",
         base_url_env_var="COPILOT_ACP_BASE_URL",
     ),
+    "agy": HermesOverlay(
+        # Google Antigravity CLI (agy) — the Gemini-CLI successor for individual
+        # Code Assist users. Execed via agent.agy_cli_client.AgyCliClient.
+        # Serves Gemini + Claude Sonnet/Opus + GPT-OSS on the Antigravity tier
+        # (incl. Claude, which cloudcode-pa can't reach).
+        transport="openai_chat",
+        auth_type="external_process",
+        base_url_override="agy://antigravity",
+    ),
     "github-copilot": HermesOverlay(
         transport="openai_chat",
         extra_env_vars=("COPILOT_GITHUB_TOKEN", "GH_TOKEN"),
@@ -310,6 +319,14 @@ ALIASES: Dict[str, str] = {
     "alibaba-coding": "alibaba-coding-plan",
     "alibaba_coding_plan": "alibaba-coding-plan",
 
+    # Google Gemini OAuth/subscription routes through Antigravity when present.
+    "google-gemini-cli": "agy",
+    "gemini-cli": "agy",
+    "antigravity": "agy",
+    "google-antigravity": "agy",
+    "gemini-oauth": "agy",
+    "gemini-sub": "agy",
+    "gemini-subscription": "agy",
     # huggingface
     "hf": "huggingface",
     "hugging-face": "huggingface",

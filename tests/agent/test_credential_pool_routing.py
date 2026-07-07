@@ -222,6 +222,21 @@ class TestPoolRotationCycle:
         assert has_retried is False
         pool.mark_exhausted_and_rotate.assert_called_once_with(status_code=402, error_context=None)
 
+    def test_billing_without_rotate_flag_skips_pool(self):
+        """OAuth extra-usage 400 sets billing but should_rotate_credential=False."""
+        from agent.error_classifier import FailoverReason
+
+        agent, pool, _ = self._make_agent_with_pool(1)
+        recovered, has_retried = agent._recover_with_credential_pool(
+            status_code=400,
+            has_retried_429=False,
+            classified_reason=FailoverReason.billing,
+            should_rotate_credential=False,
+        )
+        assert recovered is False
+        assert has_retried is False
+        pool.mark_exhausted_and_rotate.assert_not_called()
+
     def test_no_pool_returns_false(self):
         """No pool should return (False, unchanged)."""
         from run_agent import AIAgent

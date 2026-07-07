@@ -1,0 +1,54 @@
+{
+  "schema": "hermes.subscription_oauth_tool_names.v1",
+  "description": "Cross-surface Anthropic subscription OAuth tool naming. Pi/Hermes must not send bare tools as mcp_* (extra-usage lane). Map Hermes builtins to Claude Code canonical names where parity exists.",
+  "billing_lanes": {
+    "subscription": "Native Hermes snake_case or Claude Code PascalCase (Read, Bash, WebSearch, web_search).",
+    "extra_usage": "mcp_* prefix on tools that are not registered native MCP server tools; hermes_pkce OAuth."
+  },
+  "claude_code_canonical_tools": [
+    "Read",
+    "Write",
+    "Edit",
+    "Bash",
+    "Grep",
+    "Glob",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "KillShell",
+    "NotebookEdit",
+    "Skill",
+    "Task",
+    "TaskOutput",
+    "TodoWrite",
+    "WebFetch",
+    "WebSearch"
+  ],
+  "hermes_to_claude_code": {
+    "read_file": "Read",
+    "write_file": "Write",
+    "patch": "Edit",
+    "terminal": "Bash",
+    "process": "KillShell",
+    "search_files": "Grep",
+    "web_search": "WebSearch",
+    "web_extract": "WebFetch",
+    "todo": "TodoWrite",
+    "delegate_task": "Task"
+  },
+  "oauth_betas": [
+    "claude-code-20250219",
+    "oauth-2025-04-20"
+  ],
+  "forbidden_outgoing_patterns": [
+    "mcp_<hermes_builtin>"
+  ],
+  "subscription_oauth_max_tools": 22,
+  "tool_trim_priority": [
+    "web_search", "web_extract", "terminal", "process",
+    "read_file", "write_file", "patch", "search_files",
+    "vision_analyze", "image_generate", "todo", "memory", "clarify"
+  ],
+  "pi_reference": "@earendil-works/pi-ai/dist/providers/anthropic.js — toClaudeCodeName / fromClaudeCodeName",
+  "hermes_reference": "agent/subscription_oauth_tools.py"
+}

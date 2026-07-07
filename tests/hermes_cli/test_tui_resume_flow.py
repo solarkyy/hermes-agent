@@ -664,6 +664,19 @@ def test_oneshot_prints_nonempty_final_response(monkeypatch, capsys):
     assert captured.err == ""
 
 
+def test_oneshot_fails_closed_on_agent_api_failure_text(monkeypatch, capsys):
+    _stub_plugin_discovery(monkeypatch)
+    import hermes_cli.oneshot as oneshot_mod
+
+    failure = "API call failed after 3 retries: provider exploded"
+    monkeypatch.setattr(oneshot_mod, "_run_agent", lambda *_args, **_kwargs: failure)
+
+    assert oneshot_mod.run_oneshot("hello") == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert failure in captured.err
+
+
 def test_oneshot_fails_closed_on_agent_exception(monkeypatch, capsys):
     _stub_plugin_discovery(monkeypatch)
     import hermes_cli.oneshot as oneshot_mod
@@ -690,7 +703,7 @@ def test_oneshot_exit_code_when_failed_without_response(monkeypatch):
     assert run_oneshot("hi") == 2
 
 
-def test_oneshot_exit_code_zero_when_failed_with_error_text(monkeypatch, capsys):
+def test_oneshot_exit_code_nonzero_when_failed_with_error_text(monkeypatch, capsys):
     from hermes_cli.oneshot import run_oneshot
 
     monkeypatch.setattr(
@@ -700,8 +713,10 @@ def test_oneshot_exit_code_zero_when_failed_with_error_text(monkeypatch, capsys)
             {"failed": True, "partial": False},
         ),
     )
-    assert run_oneshot("hi") == 0
-    assert "HTTP 404" in capsys.readouterr().out
+    assert run_oneshot("hi") == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "HTTP 404" in captured.err
 
 
 def test_oneshot_reraises_keyboard_interrupt(monkeypatch):

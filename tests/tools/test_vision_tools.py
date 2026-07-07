@@ -173,7 +173,7 @@ class TestImageToBase64DataUrl:
 
 
 class TestHandleVisionAnalyze:
-    """Verify _handle_vision_analyze returns an Awaitable and builds correct prompt."""
+    """Verify _handle_vision_analyze routes native, aux, and Pi correctly."""
 
     def test_returns_awaitable(self):
         """The handler must return an Awaitable (coroutine) since it's registered as async."""
@@ -203,6 +203,8 @@ class TestHandleVisionAnalyze:
                 "tools.vision_tools._should_use_native_vision_fast_path",
                 return_value=False,
             ),
+            patch("tools.vision_tools.check_vision_requirements", return_value=True),
+            patch("tools.vision_tools.check_pi_vision_requirements", return_value=False),
         ):
             mock_tool.return_value = json.dumps({"result": "ok"})
             await _handle_vision_analyze(
@@ -220,6 +222,48 @@ class TestHandleVisionAnalyze:
     async def test_uses_auxiliary_vision_model_env(self):
         """AUXILIARY_VISION_MODEL env var should override DEFAULT_VISION_MODEL."""
         with (
+            patch("tools.vision_tools.check_vision_requirements", return_value=True),
+            patch("tools.vision_tools.check_pi_vision_requirements", return_value=False),
+            patch(
+                "tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock
+            ) as mock_tool,
+            patch(
+                "tools.vision_tools._should_use_native_vision_fast_path",
+                return_value=False,
+            ),
+            patch.dict(os.environ, {"AUXILIARY_VISION_MODEL": "custom/model-v1"}),
+        ):
+            mock_tool.return_value = json.dumps({"result": "ok"})
+            await _handle_vision_analyze(
+                {"image_url": "https://example.com/img.png", "question": "test"}
+            )
+            call_args = mock_tool.call_args
+            model = call_args[0][2]  # third positional arg
+            assert model == "custom/model-v1"
+
+    @pytest.mark.asyncio
+    async def test_pi_fallback_uses_configured_model_when_aux_unavailable(self):
+        with (
+            patch("tools.vision_tools._should_use_native_vision_fast_path", return_value=False),
+            patch("tools.vision_tools.check_vision_requirements", return_value=False),
+            patch("tools.vision_tools.check_pi_vision_requirements", return_value=True),
+            patch(
+                "tools.vision_tools._vision_analyze_pi", new_callable=AsyncMock
+            ) as mock_pi,
+            patch.dict(os.environ, {"HERMES_PI_VISION_MODEL": "custom/model-v1"}),
+        ):
+            mock_pi.return_value = json.dumps({"result": "ok"})
+            await _handle_vision_analyze(
+                {"image_url": "https://example.com/img.png", "question": "test"}
+            )
+            model = mock_pi.call_args.args[2]
+            assert model == "custom/model-v1"
+
+    @pytest.mark.asyncio
+    async def test_cloud_fallback_lets_router_pick_model(self):
+        with (
+            patch("tools.vision_tools.check_vision_requirements", return_value=True),
+            patch("tools.vision_tools.check_pi_vision_requirements", return_value=False),
             patch(
                 "tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock
             ) as mock_tool,
@@ -248,6 +292,8 @@ class TestHandleVisionAnalyze:
                 "tools.vision_tools._should_use_native_vision_fast_path",
                 return_value=False,
             ),
+            patch("tools.vision_tools.check_vision_requirements", return_value=True),
+            patch("tools.vision_tools.check_pi_vision_requirements", return_value=False),
             patch.dict(os.environ, {}, clear=False),
         ):
             # Ensure AUXILIARY_VISION_MODEL is not set
@@ -277,6 +323,8 @@ class TestHandleVisionAnalyze:
                 "hermes_cli.config.load_config",
                 return_value={"auxiliary": {"vision": {"model": "qwen3.7-plus"}}},
             ),
+            patch("tools.vision_tools.check_vision_requirements", return_value=True),
+            patch("tools.vision_tools.check_pi_vision_requirements", return_value=False),
             patch.dict(os.environ, {"AUXILIARY_VISION_MODEL": "env-model"}),
         ):
             mock_tool.return_value = json.dumps({"result": "ok"})
@@ -302,6 +350,8 @@ class TestHandleVisionAnalyze:
                 "hermes_cli.config.load_config",
                 return_value={"auxiliary": {"vision": {}}},
             ),
+            patch("tools.vision_tools.check_vision_requirements", return_value=True),
+            patch("tools.vision_tools.check_pi_vision_requirements", return_value=False),
             patch.dict(os.environ, {"AUXILIARY_VISION_MODEL": "fallback-model"}),
         ):
             mock_tool.return_value = json.dumps({"result": "ok"})

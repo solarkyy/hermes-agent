@@ -1,0 +1,4 @@
+max_retries: 5
+retry_backoff_ms: 1000
+dead_letter_path: ".omni/council-dead-letter.json"
+outbox_flush_interval_ms: 5000

@@ -67,16 +67,15 @@ class TestBuildAnthropicClient:
             betas = kwargs["default_headers"]["anthropic-beta"]
             assert "oauth-2025-04-20" in betas
             assert "claude-code-20250219" in betas
-            assert "interleaved-thinking-2025-05-14" in betas
-            assert "fine-grained-tool-streaming-2025-05-14" in betas
+            assert "interleaved-thinking-2025-05-14" not in betas
+            assert "fine-grained-tool-streaming-2025-05-14" not in betas
             # Native Anthropic does not get context-1m by default; accounts
             # without that beta reject even short auxiliary requests.
             assert "context-1m-2025-08-07" not in betas
             assert "api_key" not in kwargs
 
     def test_oauth_drop_context_1m_beta_strips_only_1m(self):
-        """drop_context_1m_beta=True strips context-1m-2025-08-07 while
-        preserving every other OAuth-relevant beta."""
+        """drop_context_1m_beta=True is a no-op for subscription OAuth betas."""
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
             build_anthropic_client(
                 "sk-ant-oat01-" + "x" * 60,
@@ -85,11 +84,9 @@ class TestBuildAnthropicClient:
             kwargs = mock_sdk.Anthropic.call_args[1]
             betas = kwargs["default_headers"]["anthropic-beta"]
             assert "context-1m-2025-08-07" not in betas
-            # Everything else must still be there.
             assert "oauth-2025-04-20" in betas
             assert "claude-code-20250219" in betas
-            assert "interleaved-thinking-2025-05-14" in betas
-            assert "fine-grained-tool-streaming-2025-05-14" in betas
+            assert "interleaved-thinking-2025-05-14" not in betas
 
     def test_api_key_uses_api_key(self):
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
@@ -277,19 +274,50 @@ class TestReadClaudeCodeCredentials:
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         assert read_claude_code_credentials() is None
 
+    def test_ignores_pi_placeholder_and_uses_claude_credentials_file(self, tmp_path, monkeypatch):
+        pi_auth = tmp_path / ".pi" / "agent" / "auth.json"
+        pi_auth.parent.mkdir(parents=True)
+        pi_auth.write_text(json.dumps({
+            "anthropic": {
+                "type": "oauth",
+                "access": "from-cred-file",
+                "refresh": "refresh",
+                "expires": int(time.time() * 1000) + 3600_000,
+            }
+        }))
+        cred_file = tmp_path / ".claude" / ".credentials.json"
+        cred_file.parent.mkdir(parents=True)
+        cred_file.write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-ant-oat01-live",
+                "refreshToken": "sk-ant-oat01-refresh",
+                "expiresAt": int(time.time() * 1000) + 3600_000,
+            }
+        }))
+        monkeypatch.setattr("agent.anthropic_adapter._PI_AUTH_FILE", pi_auth)
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        creds = read_claude_code_credentials()
+        assert creds is not None
+        assert creds["accessToken"] == "sk-ant-oat01-live"
+        assert creds["source"] == "claude_code_credentials_file"
+
 
 class TestIsClaudeCodeTokenValid:
     def test_valid_token(self):
-        creds = {"accessToken": "tok", "expiresAt": int(time.time() * 1000) + 3600_000}
+        creds = {"accessToken": "sk-ant-oat01-tok", "expiresAt": int(time.time() * 1000) + 3600_000}
         assert is_claude_code_token_valid(creds) is True
 
     def test_expired_token(self):
-        creds = {"accessToken": "tok", "expiresAt": int(time.time() * 1000) - 3600_000}
+        creds = {"accessToken": "sk-ant-oat01-tok", "expiresAt": int(time.time() * 1000) - 3600_000}
         assert is_claude_code_token_valid(creds) is False
 
     def test_no_expiry_but_has_token(self):
-        creds = {"accessToken": "tok", "expiresAt": 0}
+        creds = {"accessToken": "sk-ant-oat01-tok", "expiresAt": 0}
         assert is_claude_code_token_valid(creds) is True
+
+    def test_rejects_placeholder_access_token(self):
+        creds = {"accessToken": "from-cred-file", "expiresAt": int(time.time() * 1000) + 3600_000}
+        assert is_claude_code_token_valid(creds) is False
 
 
 class TestResolveAnthropicToken:
@@ -345,13 +373,13 @@ class TestResolveAnthropicToken:
         cred_file.parent.mkdir(parents=True)
         cred_file.write_text(json.dumps({
             "claudeAiOauth": {
-                "accessToken": "cc-auto-token",
+                "accessToken": "sk-ant-oat01-cc-auto-token",
                 "refreshToken": "refresh",
                 "expiresAt": int(time.time() * 1000) + 3600_000,
             }
         }))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
-        assert resolve_anthropic_token() == "cc-auto-token"
+        assert resolve_anthropic_token() == "sk-ant-oat01-cc-auto-token"
 
     def test_falls_back_to_anthropic_credential_pool_oauth(self, monkeypatch, tmp_path):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
@@ -486,14 +514,14 @@ class TestResolveAnthropicToken:
         cred_file.parent.mkdir(parents=True)
         cred_file.write_text(json.dumps({
             "claudeAiOauth": {
-                "accessToken": "cc-auto-token",
+                "accessToken": "sk-ant-oat01-cc-auto-token",
                 "refreshToken": "refresh-token",
                 "expiresAt": int(time.time() * 1000) + 3600_000,
             }
         }))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
-        assert resolve_anthropic_token() == "cc-auto-token"
+        assert resolve_anthropic_token() == "sk-ant-oat01-cc-auto-token"
 
     def test_keeps_static_anthropic_token_when_only_non_refreshable_claude_key_exists(self, monkeypatch, tmp_path):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
@@ -531,7 +559,7 @@ class TestRefreshOauthToken:
         }
 
         mock_response = json.dumps({
-            "access_token": "new-token-abc",
+            "access_token": "sk-ant-oat01-new-token-abc",
             "refresh_token": "new-refresh-456",
             "expires_in": 7200,
         }).encode()
@@ -546,12 +574,12 @@ class TestRefreshOauthToken:
 
             result = _refresh_oauth_token(creds)
 
-        assert result == "new-token-abc"
+        assert result == "sk-ant-oat01-new-token-abc"
         # Verify credentials were written back
         cred_file = tmp_path / ".claude" / ".credentials.json"
         assert cred_file.exists()
         written = json.loads(cred_file.read_text())
-        assert written["claudeAiOauth"]["accessToken"] == "new-token-abc"
+        assert written["claudeAiOauth"]["accessToken"] == "sk-ant-oat01-new-token-abc"
         assert written["claudeAiOauth"]["refreshToken"] == "new-refresh-456"
 
     def test_failed_refresh_returns_none(self, tmp_path, monkeypatch):
@@ -674,7 +702,7 @@ class TestRunOauthSetupToken:
         cred_file.parent.mkdir(parents=True)
         cred_file.write_text(json.dumps({
             "claudeAiOauth": {
-                "accessToken": "from-cred-file",
+                "accessToken": "sk-ant-oat01-from-cred-file",
                 "refreshToken": "refresh",
                 "expiresAt": int(time.time() * 1000) + 3600_000,
             }
@@ -685,7 +713,7 @@ class TestRunOauthSetupToken:
             mock_run.return_value = MagicMock(returncode=0)
             token = run_oauth_setup_token()
 
-        assert token == "from-cred-file"
+        assert token == "sk-ant-oat01-from-cred-file"
         # Don't assert exact call count — the contract is "credentials flow
         # through", not "exactly one subprocess call". xdist cross-test
         # pollution (other tests shimming subprocess via plugins) has flaked
@@ -1367,10 +1395,10 @@ class TestBuildAnthropicKwargs:
         assert "fast-mode-2026-02-01" in betas
         assert "oauth-2025-04-20" in betas
         assert "context-1m-2025-08-07" not in betas
+        assert "interleaved-thinking-2025-05-14" not in betas
 
     def test_fast_mode_oauth_drop_context_1m_beta_strips_only_1m(self):
-        """drop_context_1m_beta=True strips context-1m from fast-mode
-        extra_headers while preserving every other OAuth + fast-mode beta."""
+        """drop_context_1m_beta=True is a no-op for subscription OAuth betas."""
         kwargs = build_anthropic_kwargs(
             model="claude-opus-4-6",
             messages=[{"role": "user", "content": "Hi"}],
@@ -1386,7 +1414,7 @@ class TestBuildAnthropicKwargs:
         assert "fast-mode-2026-02-01" in betas
         assert "oauth-2025-04-20" in betas
         assert "claude-code-20250219" in betas
-        assert "interleaved-thinking-2025-05-14" in betas
+        assert "interleaved-thinking-2025-05-14" not in betas
 
     def test_reasoning_config_maps_to_manual_thinking_for_pre_4_6_models(self):
         kwargs = build_anthropic_kwargs(

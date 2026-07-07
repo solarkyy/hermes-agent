@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -271,6 +272,16 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gemini-3-pro-preview",
         "gemini-3.5-flash",
         "gemini-3.1-flash-lite-preview",
+    ],
+    "agy": [
+        # Antigravity CLI (agy) — serves these via Code Assist on the
+        # Antigravity-eligible tier (incl. Claude, which cloudcode-pa could not reach).
+        "gemini-3.5-flash",
+        "gemini-3-flash-preview",
+        "gemini-3.1-pro-preview",
+        "claude-sonnet-4.6",
+        "claude-opus-4.6",
+        "gpt-oss-120b",
     ],
     "zai": [
         "glm-5.2",
@@ -1044,8 +1055,9 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("copilot",        "GitHub Copilot",           "GitHub Copilot (Uses GITHUB_TOKEN or gh auth token)"),
     ProviderEntry("copilot-acp",    "GitHub Copilot ACP",       "GitHub Copilot ACP (Spawns copilot --acp --stdio)"),
     ProviderEntry("huggingface",    "Hugging Face",             "Hugging Face Inference Providers"),
-    ProviderEntry("gemini",         "Google AI Studio",         "Google AI Studio (Native Gemini API)"),
+    ProviderEntry("gemini",         "Google AI Studio",         "Google AI Studio (Native Gemini API / API key)"),
     ProviderEntry("vertex",         "Google Vertex AI",         "Google Vertex AI (Gemini via GCP; OAuth2 service account or ADC, GCP billing/quotas)"),
+    ProviderEntry("agy",            "Google Antigravity (OAuth)", "Google Gemini/Claude via Antigravity CLI subscription OAuth (agy)"),
     ProviderEntry("deepseek",       "DeepSeek",                 "DeepSeek (V3, R1, coder, direct API)"),
     ProviderEntry("xai",            "xAI",                      "xAI Grok (Direct API)"),
     ProviderEntry("zai",            "Z.AI / GLM",               "Z.AI / GLM (Zhipu direct API)"),
@@ -1116,7 +1128,7 @@ PROVIDER_GROUPS: dict[str, tuple[str, str, list[str]]] = {
     "kimi":     ("Kimi / Moonshot", "Coding Plan, Moonshot global & China endpoints", ["kimi-coding", "kimi-coding-cn"]),
     "minimax":  ("MiniMax",         "Global, OAuth Coding Plan & China endpoints",     ["minimax", "minimax-oauth", "minimax-cn"]),
     "xai":      ("xAI Grok",        "Direct API or SuperGrok / Premium+ OAuth",        ["xai", "xai-oauth"]),
-    "google":   ("Google Gemini",   "Google AI Studio (API key)",                     ["gemini"]),
+    "google":   ("Google Gemini",   "Antigravity subscription OAuth or AI Studio API", ["agy", "gemini"]),
     "openai":   ("OpenAI",          "Codex CLI or direct OpenAI API",                  ["openai-codex", "openai-api"]),
     "opencode": ("OpenCode",        "Zen pay-as-you-go or Go subscription",            ["opencode-zen", "opencode-go"]),
     "copilot":  ("GitHub Copilot",  "GitHub token API or copilot --acp process",       ["copilot", "copilot-acp"]),
@@ -1241,6 +1253,13 @@ _PROVIDER_ALIASES = {
     "qwen": "alibaba",
     "alibaba-cloud": "alibaba",
     "qwen-portal": "qwen-oauth",
+    "google-gemini-cli": "agy",
+    "gemini-cli": "agy",
+    "antigravity": "agy",
+    "google-antigravity": "agy",
+    "gemini-oauth": "agy",
+    "gemini-sub": "agy",
+    "gemini-subscription": "agy",
     "hf": "huggingface",
     "hugging-face": "huggingface",
     "huggingface-hub": "huggingface",
@@ -1924,6 +1943,19 @@ def detect_static_provider_for_model(
     # If the model belongs to the current provider's catalog, don't suggest switching
     if _model_in_provider_catalog(name_lower, current_keys):
         return None
+
+    # If a bare Gemini model is requested while another provider is active,
+    # prefer Antigravity when the local agy binary exists. That path reuses the
+    # user's Google subscription OAuth instead of silently selecting the AI
+    # Studio API-key provider just because its static catalog appears first.
+    if (
+        name_lower.startswith("gemini-")
+        and "agy" not in current_keys
+        and any(name_lower == m.lower() for m in _PROVIDER_MODELS.get("agy", []))
+    ):
+        agy_cmd = os.getenv("HERMES_AGY_COMMAND", "").strip() or os.getenv("AGY_CLI_PATH", "").strip() or "agy"
+        if shutil.which(agy_cmd) or (os.path.sep in agy_cmd and os.path.exists(agy_cmd)):
+            return ("agy", name)
 
     # --- Step 1: check static provider catalogs for a direct match ---
     # If the current provider is a custom endpoint (custom or custom:*), never
@@ -2720,8 +2752,8 @@ def _fetch_anthropic_models(
     is_oauth = _is_oauth_token(token)
     if is_oauth:
         headers["Authorization"] = f"Bearer {token}"
-        from agent.anthropic_adapter import _COMMON_BETAS, _OAUTH_ONLY_BETAS, _CONTEXT_1M_BETA
-        headers["anthropic-beta"] = ",".join(_COMMON_BETAS + _OAUTH_ONLY_BETAS)
+        from agent.anthropic_adapter import subscription_oauth_betas
+        headers["anthropic-beta"] = ",".join(subscription_oauth_betas())
     else:
         headers["x-api-key"] = token
 
@@ -2750,10 +2782,7 @@ def _fetch_anthropic_models(
                 except Exception:
                     body_text = ""
                 if "long context beta" in body_text and "not yet available" in body_text:
-                    headers["anthropic-beta"] = ",".join(
-                        [b for b in _COMMON_BETAS if b != _CONTEXT_1M_BETA]
-                        + list(_OAUTH_ONLY_BETAS)
-                    )
+                    headers["anthropic-beta"] = ",".join(subscription_oauth_betas())
                     data = _do_request(headers)
                 else:
                     raise

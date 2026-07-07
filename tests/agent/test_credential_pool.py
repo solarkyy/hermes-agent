@@ -1805,6 +1805,56 @@ def test_load_pool_oauth_path_still_autodiscovers(tmp_path, monkeypatch):
     assert "claude_code" in sources
 
 
+def test_load_pool_prefers_claude_code_over_manual_hermes_pkce(tmp_path, monkeypatch):
+    """Pi/Claude Code subscription OAuth must beat Hermes PKCE pool entries."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setattr("hermes_cli.auth.is_provider_explicitly_configured", lambda pid: True)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "manual-1",
+                        "label": "main",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:hermes_pkce",
+                        "access_token": "pkce-token",
+                        "refresh_token": "pkce-refresh",
+                        "expires_at_ms": int(time.time() * 1000) + 3_600_000,
+                    }
+                ]
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_hermes_oauth_credentials",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_claude_code_credentials",
+        lambda: {
+            "accessToken": "pi-subscription-token",
+            "refreshToken": "pi-refresh",
+            "expiresAt": int(time.time() * 1000) + 3_600_000,
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("anthropic")
+    entry = pool.select()
+
+    assert entry is not None
+    assert entry.source == "claude_code"
+    assert entry.access_token == "pi-subscription-token"
+
+
 def test_least_used_strategy_selects_lowest_count(tmp_path, monkeypatch):
     """least_used strategy should select the credential with the lowest request_count."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))

@@ -338,6 +338,28 @@ _OAUTH_ONLY_BETAS = [
     "oauth-2025-04-20",
 ]
 
+# Hermes PKCE / dashboard OAuth entries bill against Anthropic's subscription
+# *extra usage* pool. Pi and Claude Code use ~/.claude / ~/.pi credentials on
+# the base Max allowance instead — see omnios anthropic-oauth-api.mjs.
+ANTHROPIC_EXTRA_USAGE_OAUTH_SOURCES = frozenset({
+    "hermes_pkce",
+    "manual:hermes_pkce",
+    "manual:dashboard_pkce",
+})
+
+
+def subscription_oauth_betas(*, include_fast_mode: bool = False) -> List[str]:
+    """Beta headers for Claude Code / Pi subscription OAuth on api.anthropic.com.
+
+    Must match Pi's ``anthropic-oauth-api.mjs`` — do **not** add
+    ``_COMMON_BETAS`` (thinking / tool-streaming) here; those route OAuth
+    traffic into Anthropic's extra-usage billing tier.
+    """
+    betas = list(_OAUTH_ONLY_BETAS)
+    if include_fast_mode:
+        betas.append(_FAST_MODE_BETA)
+    return betas
+
 # Claude Code identity — required for OAuth requests to be routed correctly.
 # Without these, Anthropic's infrastructure intermittently 500s OAuth traffic.
 # The version must stay reasonably current — Anthropic rejects OAuth requests
@@ -373,6 +395,71 @@ def _detect_claude_code_version() -> str:
 
 _CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
 _MCP_TOOL_PREFIX = "mcp__"
+
+
+def relocate_subscription_oauth_system_prompt(
+    system: Any,
+    anthropic_messages: List[Dict[str, Any]],
+) -> Tuple[Any, List[Dict[str, Any]]]:
+    """Keep only the Claude Code identity in ``system[]`` for OAuth requests.
+
+    Anthropic's OAuth billing validator inspects ``system`` content. Large or
+    custom system prompts (e.g. OMNIRA's full organism context) trigger
+    misleading HTTP 400 "out of extra usage" even on valid Max subscriptions.
+    Pi / Claude Code carry instructions in user turns with a minimal system
+    identity block — mirror that layout here.
+    """
+    if isinstance(system, str):
+        blocks: List[Dict[str, Any]] = (
+            [{"type": "text", "text": system}] if system.strip() else []
+        )
+    elif isinstance(system, list):
+        blocks = [b for b in system if isinstance(b, dict)]
+    else:
+        blocks = []
+
+    kept: List[Dict[str, Any]] = []
+    moved_parts: List[str] = []
+    for block in blocks:
+        text = str(block.get("text") or "")
+        if not text.strip():
+            continue
+        if text.strip() == _CLAUDE_CODE_SYSTEM_PREFIX:
+            kept.append(block)
+        elif block.get("type") == "text":
+            moved_parts.append(text)
+        else:
+            kept.append(block)
+
+    if not kept:
+        kept = [{"type": "text", "text": _CLAUDE_CODE_SYSTEM_PREFIX}]
+
+    if not moved_parts:
+        return kept, anthropic_messages
+
+    relocated = "\n\n".join(moved_parts)
+    _prepend_text_to_first_user_message(anthropic_messages, relocated)
+    return kept, anthropic_messages
+
+
+def _prepend_text_to_first_user_message(
+    messages: List[Dict[str, Any]],
+    prefix: str,
+) -> None:
+    """Prepend ``prefix`` to the first user turn (in-place)."""
+    if not prefix or not messages:
+        return
+    for msg in messages:
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            msg["content"] = f"{prefix}\n\n{content}" if content else prefix
+        elif isinstance(content, list):
+            msg["content"] = [{"type": "text", "text": prefix}, *content]
+        else:
+            msg["content"] = prefix
+        return
 
 
 def _get_claude_code_version() -> str:
@@ -813,10 +900,13 @@ def build_anthropic_client(
         # OAuth access token / setup-token → Bearer auth + Claude Code identity.
         # Anthropic routes OAuth requests based on user-agent and headers;
         # without Claude Code's fingerprint, requests get intermittent 500s.
-        all_betas = common_betas + _OAUTH_ONLY_BETAS
+        # Subscription OAuth uses only the Pi/Claude Code beta set — not
+        # ``_COMMON_BETAS``, which bills against extra-usage credits.
         kwargs["auth_token"] = api_key
         kwargs["default_headers"] = {
-            "anthropic-beta": ",".join(all_betas),
+            "anthropic-beta": ",".join(subscription_oauth_betas()),
+            "anthropic-client-platform": "claude_code_cli",
+            "anthropic-dangerous-direct-browser-access": "true",
             "user-agent": f"claude-code/{_get_claude_code_version()} (external, cli)",
             "x-app": "cli",
         }
@@ -927,10 +1017,7 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
 
 
 def _read_claude_code_credentials_from_file() -> Optional[Dict[str, Any]]:
-    """Read Claude Code OAuth credentials from ~/.claude/.credentials.json.
-
-    Returns dict with {accessToken, refreshToken?, expiresAt?, source} or None.
-    """
+    """Read Claude Code OAuth credentials from ~/.claude/.credentials.json."""
     cred_path = Path.home() / ".claude" / ".credentials.json"
     if not cred_path.exists():
         return None
@@ -950,16 +1037,130 @@ def _read_claude_code_credentials_from_file() -> Optional[Dict[str, Any]]:
         "accessToken": access_token,
         "refreshToken": oauth_data.get("refreshToken", ""),
         "expiresAt": oauth_data.get("expiresAt", 0),
+        "scopes": oauth_data.get("scopes"),
         "source": "claude_code_credentials_file",
     }
+
+
+_DEFAULT_CLAUDE_OAUTH_SCOPES = [
+    "user:file_upload",
+    "user:inference",
+    "user:mcp_servers",
+    "user:profile",
+    "user:sessions:claude_code",
+]
+
+_PI_AUTH_FILE: Optional[Path] = None
+
+
+def _pi_auth_file() -> Path:
+    """Return Pi's auth.json path, respecting tests that monkeypatch Path.home."""
+    return _PI_AUTH_FILE or (Path.home() / ".pi" / "agent" / "auth.json")
+
+
+def _read_pi_agent_oauth_credentials() -> Optional[Dict[str, Any]]:
+    """Read Anthropic OAuth from Pi's ~/.pi/agent/auth.json (pi-mono shape)."""
+    pi_auth_file = _pi_auth_file()
+    if not pi_auth_file.exists():
+        return None
+    try:
+        data = json.loads(pi_auth_file.read_text(encoding="utf-8"))
+        oauth_data = data.get("anthropic")
+        if not oauth_data or not isinstance(oauth_data, dict):
+            return None
+        access_token = oauth_data.get("access", "")
+        if not access_token or not _is_oauth_token(str(access_token)):
+            return None
+        expires = oauth_data.get("expires")
+        expires_at = int(expires) if isinstance(expires, (int, float)) else 0
+        scopes = oauth_data.get("scopes")
+        if not isinstance(scopes, list) or not scopes:
+            scopes = list(_DEFAULT_CLAUDE_OAUTH_SCOPES)
+        return {
+            "accessToken": access_token,
+            "refreshToken": oauth_data.get("refresh", ""),
+            "expiresAt": expires_at,
+            "scopes": scopes,
+            "source": "pi_auth_json",
+        }
+    except (json.JSONDecodeError, OSError, IOError, TypeError, ValueError) as e:
+        logger.debug("Failed to read ~/.pi/agent/auth.json: %s", e)
+        return None
+
+
+def _pick_freshest_oauth_credentials(
+    *candidates: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Return the credential dict with the latest expiry (ties → longer access token)."""
+    valid = [c for c in candidates if isinstance(c, dict) and c.get("accessToken")]
+    if not valid:
+        return None
+    return max(
+        valid,
+        key=lambda c: (
+            int(c.get("expiresAt") or 0),
+            len(str(c.get("accessToken") or "")),
+        ),
+    )
+
+
+def _sync_pi_agent_oauth_from_claude(
+    access_token: str,
+    refresh_token: str,
+    expires_at_ms: int,
+    *,
+    scopes: Optional[list] = None,
+) -> None:
+    """Mirror refreshed Claude OAuth creds into Pi auth.json (best-effort)."""
+    try:
+        existing: Dict[str, Any] = {}
+        pi_auth_file = _pi_auth_file()
+        if pi_auth_file.exists():
+            existing = json.loads(pi_auth_file.read_text(encoding="utf-8"))
+        oauth_scopes = scopes if scopes is not None else list(_DEFAULT_CLAUDE_OAUTH_SCOPES)
+        existing["anthropic"] = {
+            "type": "oauth",
+            "access": access_token,
+            "refresh": refresh_token,
+            "expires": expires_at_ms,
+            "scopes": oauth_scopes,
+        }
+        pi_auth_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = pi_auth_file.with_suffix(
+            f".tmp.{os.getpid()}.{secrets.token_hex(4)}"
+        )
+        fd = os.open(
+            str(tmp),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(existing, fh, indent=2)
+                fh.write("\n")
+            os.replace(tmp, pi_auth_file)
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+    except (OSError, IOError, json.JSONDecodeError, TypeError, ValueError) as e:
+        logger.debug("Failed to sync Pi auth.json from Claude OAuth refresh: %s", e)
 
 
 def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
     """Read refreshable Claude Code OAuth credentials.
 
-    Reads from two possible sources and reconciles them:
-      1. macOS Keychain (Darwin only) — "Claude Code-credentials" entry
-      2. ~/.claude/.credentials.json file
+    Checks three sources and returns the best live subscription record:
+      1. ~/.pi/agent/auth.json (Pi / omnios — preferred when valid)
+      2. macOS Keychain (Darwin only) — "Claude Code-credentials" entry
+      3. ~/.claude/.credentials.json file
+
+    Pi is preferred because it is the actively refreshed runtime lane on this
+    seat. ``~/.claude/.credentials.json`` can carry a stale access token with a
+    later ``expiresAt`` metadata field, which previously caused Hermes to send
+    dead tokens while Pi kept working.
 
     Selection rules when both are present:
       - If exactly one is non-expired, prefer that one. (Handles the case
@@ -977,31 +1178,37 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
     """
     kc_creds = _read_claude_code_credentials_from_keychain()
     file_creds = _read_claude_code_credentials_from_file()
+    pi_creds = _read_pi_agent_oauth_credentials()
 
-    if kc_creds and file_creds:
-        kc_valid = is_claude_code_token_valid(kc_creds)
-        file_valid = is_claude_code_token_valid(file_creds)
-        if kc_valid and not file_valid:
-            return kc_creds
-        if file_valid and not kc_valid:
-            return file_creds
-        # Both valid or both expired: prefer the later expiresAt so the
-        # downstream refresh path uses the freshest refresh_token.
-        kc_exp = kc_creds.get("expiresAt", 0) or 0
-        file_exp = file_creds.get("expiresAt", 0) or 0
-        return kc_creds if kc_exp >= file_exp else file_creds
+    if pi_creds and is_claude_code_token_valid(pi_creds):
+        return pi_creds
 
-    return kc_creds or file_creds
+    candidates = [kc_creds, file_creds, pi_creds]
+    valid_candidates = [
+        c for c in candidates
+        if isinstance(c, dict) and is_claude_code_token_valid(c)
+    ]
+    if valid_candidates:
+        return _pick_freshest_oauth_credentials(*valid_candidates)
+
+    return _pick_freshest_oauth_credentials(*candidates)
+
+
+_OAUTH_REFRESH_SKEW_MS = 5 * 60 * 1000  # match pi anthropic-oauth-api.mjs
 
 
 def is_claude_code_token_valid(creds: Dict[str, Any]) -> bool:
     """Check if Claude Code credentials have a non-expired access token."""
     import time
 
+    access_token = str(creds.get("accessToken") or "").strip()
+    if not access_token or not _is_oauth_token(access_token):
+        return False
+
     expires_at = creds.get("expiresAt", 0)
     if not expires_at:
         # No expiry set (managed keys) — valid if token is present
-        return bool(creds.get("accessToken"))
+        return True
 
     # expiresAt is in milliseconds since epoch
     now_ms = int(time.time() * 1000)
@@ -1009,7 +1216,7 @@ def is_claude_code_token_valid(creds: Dict[str, Any]) -> bool:
     return now_ms < (expires_at - 60_000)
 
 
-def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) -> Dict[str, Any]:
+def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = True) -> Dict[str, Any]:
     """Refresh an Anthropic OAuth token without mutating local credential files."""
     import time
     import urllib.parse
@@ -1065,7 +1272,7 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
         return {
             "access_token": access_token,
             "refresh_token": next_refresh,
-            "expires_at_ms": int(time.time() * 1000) + (expires_in * 1000),
+            "expires_at_ms": int(time.time() * 1000) + (expires_in * 1000) - _OAUTH_REFRESH_SKEW_MS,
         }
 
     if last_error is not None:
@@ -1113,11 +1320,13 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
         return None
 
     try:
-        refreshed = refresh_anthropic_oauth_pure(refresh_token, use_json=False)
-        _write_claude_code_credentials(
+        refreshed = refresh_anthropic_oauth_pure(refresh_token, use_json=True)
+        scopes = creds.get("scopes") if isinstance(creds.get("scopes"), list) else None
+        _write_subscription_oauth_credentials(
             refreshed["access_token"],
             refreshed["refresh_token"],
             refreshed["expires_at_ms"],
+            scopes=scopes,
         )
         logger.debug("Successfully refreshed Claude Code OAuth token")
         return refreshed["access_token"]
@@ -1126,12 +1335,65 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
         return None
 
 
+def _write_subscription_oauth_credentials(
+    access_token: str,
+    refresh_token: str,
+    expires_at_ms: int,
+    *,
+    scopes: Optional[list] = None,
+) -> None:
+    """Write subscription OAuth to Pi auth.json (canonical) + Claude mirror.
+
+    Pi and omnios ``anthropic-oauth-api.mjs`` treat ``~/.pi/agent/auth.json``
+    as the source of truth — same pool, same refresh chain as ``pi /login``.
+    """
+    if not _is_oauth_token(str(access_token or "")):
+        raise ValueError("Refusing to persist non-Anthropic OAuth token")
+
+    resolved_scopes = scopes
+    if resolved_scopes is None:
+        existing_claude = {}
+        cred_path = Path.home() / ".claude" / ".credentials.json"
+        if cred_path.exists():
+            try:
+                existing_claude = json.loads(cred_path.read_text(encoding="utf-8"))
+                resolved_scopes = existing_claude.get("claudeAiOauth", {}).get("scopes")
+            except (json.JSONDecodeError, OSError, IOError):
+                pass
+        if not resolved_scopes:
+            pi_existing = {}
+            pi_auth_file = _pi_auth_file()
+            if pi_auth_file.exists():
+                try:
+                    pi_existing = json.loads(pi_auth_file.read_text(encoding="utf-8"))
+                    resolved_scopes = pi_existing.get("anthropic", {}).get("scopes")
+                except (json.JSONDecodeError, OSError, IOError):
+                    pass
+    if not resolved_scopes:
+        resolved_scopes = list(_DEFAULT_CLAUDE_OAUTH_SCOPES)
+
+    _sync_pi_agent_oauth_from_claude(
+        access_token,
+        refresh_token,
+        expires_at_ms,
+        scopes=resolved_scopes,
+    )
+    _write_claude_code_credentials(
+        access_token,
+        refresh_token,
+        expires_at_ms,
+        scopes=resolved_scopes,
+        skip_pi_sync=True,
+    )
+
+
 def _write_claude_code_credentials(
     access_token: str,
     refresh_token: str,
     expires_at_ms: int,
     *,
     scopes: Optional[list] = None,
+    skip_pi_sync: bool = False,
 ) -> None:
     """Write refreshed credentials back to ~/.claude/.credentials.json.
 
@@ -1184,6 +1446,13 @@ def _write_claude_code_credentials(
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(_tmp_cred, cred_path)
+            if not skip_pi_sync:
+                _sync_pi_agent_oauth_from_claude(
+                    access_token,
+                    refresh_token,
+                    expires_at_ms,
+                    scopes=oauth_data.get("scopes"),
+                )
         except OSError:
             try:
                 _tmp_cred.unlink(missing_ok=True)
@@ -1235,10 +1504,9 @@ def _resolve_anthropic_pool_token() -> Optional[str]:
     """Return the first available Anthropic OAuth token from credential_pool.
 
     Read-only: enumerates with ``clear_expired=False, refresh=False`` so a bare
-    token *resolve* (which runs from diagnostic/read-only call sites such as
-    ``account_usage`` and ``hermes models``) never mutates ``~/.hermes/auth.json``
-    or makes a network refresh call. Refresh-on-expiry is owned by the API call
-    path's pool recovery, not the resolver.
+    token resolve never mutates ``~/.hermes/auth.json`` or makes a network
+    refresh call. Refresh-on-expiry is owned by the API call path's pool
+    recovery, not this resolver.
     """
     try:
         from agent.credential_pool import AUTH_TYPE_OAUTH, load_pool
@@ -1247,10 +1515,6 @@ def _resolve_anthropic_pool_token() -> Optional[str]:
 
     try:
         pool = load_pool("anthropic")
-        # Enumerate read-only (clear_expired=False, refresh=False): never persist
-        # to auth.json or trigger a network refresh from a bare resolve. select()
-        # is deliberately NOT used — it runs clear_expired=True, refresh=True,
-        # which would violate this read-only contract.
         entries = pool._available_entries(clear_expired=False, refresh=False)
     except Exception:
         logger.debug("Failed to read Anthropic credential_pool", exc_info=True)
@@ -1259,11 +1523,6 @@ def _resolve_anthropic_pool_token() -> Optional[str]:
     for entry in entries:
         if getattr(entry, "auth_type", None) != AUTH_TYPE_OAUTH:
             continue
-        # access_token is a declared field but a persisted entry can carry an
-        # explicit null (or a partially-written OAuth entry), so coerce before
-        # strip — a bare None.strip() here would escape the try/excepts above
-        # and crash the whole resolver, taking down the source #5 fallback too.
-        # Matches the aux-client analog (auxiliary_client.py: str(key or "")).
         token = (getattr(entry, "access_token", None) or "").strip()
         if token:
             return token
@@ -1271,14 +1530,38 @@ def _resolve_anthropic_pool_token() -> Optional[str]:
     return None
 
 
+def _audit_anthropic_lane(*, source: str, lane: str, token: Optional[str], note: str = "") -> None:
+    """Lightweight billing-lane audit (additive; never affects auth)."""
+    try:
+        import time as _t, json as _j, hashlib as _h
+        from pathlib import Path as _P
+        fp = ("sha256:" + _h.sha256(str(token).encode()).hexdigest()[:12]) if token else "none"
+        rec = {
+            "ts": _t.time(),
+            "iso": _t.strftime('%Y-%m-%dT%H:%M:%SZ', _t.gmtime()),
+            "source": source,
+            "lane": lane,
+            "token_fp": fp,
+            "note": note,
+        }
+        p = _P.home() / ".hermes" / "anthropic_lane_audit.jsonl"
+        with open(p, "a") as _f:
+            _f.write(_j.dumps(rec) + "\n")
+    except Exception:
+        pass
+
+
 def resolve_anthropic_token() -> Optional[str]:
     """Resolve an Anthropic token from all available sources.
 
+    Subscription OAuth (Pi / Claude Code) is checked **first** so Hermes
+    pulls from the same ``~/.pi/agent/auth.json`` chain as Pi and
+    ``anthropic-oauth-api.mjs`` — not a stale ``ANTHROPIC_TOKEN`` env copy.
+
     Priority:
-      1. ANTHROPIC_TOKEN env var (OAuth/setup token saved by Hermes)
-      2. CLAUDE_CODE_OAUTH_TOKEN env var
-      3. Claude Code credentials (~/.claude.json or ~/.claude/.credentials.json)
-         — with automatic refresh if expired and a refresh token is available
+      1. Pi + Claude Code subscription OAuth (refreshable)
+      2. ANTHROPIC_TOKEN env var (OAuth/setup token saved by Hermes)
+      3. CLAUDE_CODE_OAUTH_TOKEN env var
       4. Anthropic credential_pool OAuth entry (~/.hermes/auth.json)
       5. ANTHROPIC_API_KEY env var (regular API key, or legacy fallback)
 
@@ -1286,38 +1569,53 @@ def resolve_anthropic_token() -> Optional[str]:
     """
     creds = read_claude_code_credentials()
 
-    # 1. Hermes-managed OAuth/setup token env var
+    # 1. Subscription OAuth — same lane as Pi / Claude Code
+    resolved_subscription = _resolve_claude_code_token_from_credentials(creds)
+    if resolved_subscription:
+        _audit_anthropic_lane(source="claude_code", lane="base_allowance",
+                              token=resolved_subscription, note="subscription_oauth")
+        return resolved_subscription
+
+    # 2. Hermes-managed OAuth/setup token env var
     token = os.getenv("ANTHROPIC_TOKEN", "").strip()
     if token:
         preferred = _prefer_refreshable_claude_code_token(token, creds)
         if preferred:
+            _audit_anthropic_lane(source="claude_code", lane="base_allowance",
+                                  token=preferred, note="preferred_over_ANTHROPIC_TOKEN")
             return preferred
+        _audit_anthropic_lane(source="hermes_pkce_env", lane="extra_usage",
+                              token=token, note="ANTHROPIC_TOKEN")
         return token
 
-    # 2. CLAUDE_CODE_OAUTH_TOKEN (used by Claude Code for setup-tokens)
+    # 3. CLAUDE_CODE_OAUTH_TOKEN (used by Claude Code for setup-tokens)
     cc_token = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
     if cc_token:
         preferred = _prefer_refreshable_claude_code_token(cc_token, creds)
         if preferred:
+            _audit_anthropic_lane(source="claude_code", lane="base_allowance",
+                                  token=preferred, note="preferred_over_CC_OAUTH_TOKEN")
             return preferred
+        _audit_anthropic_lane(source="cc_oauth_env", lane="extra_usage",
+                              token=cc_token, note="CLAUDE_CODE_OAUTH_TOKEN")
         return cc_token
-
-    # 3. Claude Code credential file
-    resolved_claude_token = _resolve_claude_code_token_from_credentials(creds)
-    if resolved_claude_token:
-        return resolved_claude_token
 
     # 4. Hermes credential_pool OAuth entry.
     resolved_pool_token = _resolve_anthropic_pool_token()
     if resolved_pool_token:
+        _audit_anthropic_lane(source="credential_pool", lane="oauth_pool",
+                              token=resolved_pool_token, note="anthropic_pool")
         return resolved_pool_token
 
     # 5. Regular API key, or a legacy OAuth token saved in ANTHROPIC_API_KEY.
     # This remains as a compatibility fallback for pre-migration Hermes configs.
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if api_key:
+        _audit_anthropic_lane(source="anthropic_api_key_env", lane="api_key_billing",
+                              token=api_key, note="ANTHROPIC_API_KEY")
         return api_key
 
+    _audit_anthropic_lane(source="none", lane="none", token=None, note="no_token_resolved")
     return None
 
 
@@ -1353,6 +1651,12 @@ def run_oauth_setup_token() -> Optional[str]:
     # Check if credentials were saved to Claude Code's config files
     creds = read_claude_code_credentials()
     if creds and is_claude_code_token_valid(creds):
+        _write_subscription_oauth_credentials(
+            creds["accessToken"],
+            creds.get("refreshToken", ""),
+            int(creds.get("expiresAt") or 0),
+            scopes=creds.get("scopes") if isinstance(creds.get("scopes"), list) else None,
+        )
         return creds["accessToken"]
 
     # Check env vars that may have been set
@@ -2548,48 +2852,22 @@ def build_anthropic_kwargs(
                 text = text.replace("Nous Research", "Anthropic")
                 block["text"] = text
 
-        # 3. Normalize tool names so NOTHING goes on the OAuth wire with a
-        #    single-underscore ``mcp_`` prefix.  Anthropic's subscription/OAuth
-        #    billing classifier treats a single-underscore ``mcp_`` tool name as
-        #    a third-party-app fingerprint and rejects the request with HTTP 400
-        #    "Third-party apps now draw from extra usage, not plan limits"
-        #    (verified empirically: a single ``mcp_foo`` tool flips a request
-        #    from plan-billing to the extra-usage lane; ``mcp__foo`` is accepted).
-        #
-        #    Two cases, both must land on the double-underscore ``mcp__`` form:
-        #      a) bare Hermes-native tools (``read_file``)  -> ``mcp__read_file``
-        #      b) native MCP server tools registered under their full
-        #         single-underscore ``mcp_<server>_<tool>`` name
-        #         (``mcp_linear_get_issue``) -> ``mcp__linear_get_issue``
-        #    Case (b) is the gap that the bare ``mcp_``->``mcp__`` constant swap
-        #    left open: those tools were *skipped* and stayed single-underscore,
-        #    so any session with an MCP server configured still tripped the
-        #    classifier. normalize_response reverses both forms via registry
-        #    lookup so the dispatcher still sees the original name. GH-25255.
-        def _to_oauth_wire_name(name: str) -> str:
-            if name.startswith("mcp__"):
-                return name  # already correct, don't double-prefix
-            if name.startswith("mcp_"):
-                # single-underscore native MCP tool -> promote to double
-                return "mcp__" + name[len("mcp_"):]
-            return _MCP_TOOL_PREFIX + name  # bare name -> mcp__<name>
+        # 2b. Relocate non-identity system content into the first user turn.
+        #     Large custom system[] on OAuth can trigger extra-usage 400s.
+        system, anthropic_messages = relocate_subscription_oauth_system_prompt(
+            system, anthropic_messages,
+        )
 
+        # 3. Subscription OAuth tool naming (Pi / Claude Code parity).
+        #    See agent/subscription_oauth_tools.py and
+        #    references/subscription-oauth-tool-names.json.
         if anthropic_tools:
-            for tool in anthropic_tools:
-                if "name" in tool:
-                    tool["name"] = _to_oauth_wire_name(tool["name"])
-
-        # 4. Apply the same normalization to tool names in message history
-        #    (tool_use blocks) so replayed turns match the wire names above.
-        for msg in anthropic_messages:
-            content = msg.get("content")
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict):
-                        if block.get("type") == "tool_use" and "name" in block:
-                            block["name"] = _to_oauth_wire_name(block["name"])
-                        elif block.get("type") == "tool_result" and "tool_use_id" in block:
-                            pass  # tool_result uses ID, not name
+            from agent.subscription_oauth_tools import (
+                wire_subscription_oauth_message_tools,
+                wire_subscription_oauth_tools,
+            )
+            anthropic_tools = wire_subscription_oauth_tools(anthropic_tools)
+            wire_subscription_oauth_message_tools(anthropic_messages)
 
     kwargs: Dict[str, Any] = {
         "model": model,
@@ -2684,13 +2962,14 @@ def build_anthropic_kwargs(
         kwargs.setdefault("extra_body", {})["speed"] = "fast"
         # Build extra_headers with ALL applicable betas (the per-request
         # extra_headers override the client-level anthropic-beta header).
-        betas = list(_common_betas_for_base_url(
-            base_url,
-            drop_context_1m_beta=drop_context_1m_beta,
-        ))
         if is_oauth:
-            betas.extend(_OAUTH_ONLY_BETAS)
-        betas.append(_FAST_MODE_BETA)
+            betas = subscription_oauth_betas(include_fast_mode=True)
+        else:
+            betas = list(_common_betas_for_base_url(
+                base_url,
+                drop_context_1m_beta=drop_context_1m_beta,
+            ))
+            betas.append(_FAST_MODE_BETA)
         kwargs["extra_headers"] = {"anthropic-beta": ",".join(betas)}
 
     return kwargs

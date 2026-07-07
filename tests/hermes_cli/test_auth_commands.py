@@ -102,12 +102,21 @@ def test_auth_add_anthropic_oauth_persists_pool_entry(tmp_path, monkeypatch):
     _write_auth_store(tmp_path, {"version": 1, "providers": {}})
     token = _jwt_with_email("claude@example.com")
     monkeypatch.setattr(
-        "agent.anthropic_adapter.run_hermes_oauth_login_pure",
+        "agent.anthropic_adapter.run_oauth_setup_token",
+        lambda: token,
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_claude_code_credentials",
         lambda: {
-            "access_token": token,
-            "refresh_token": "refresh-token",
-            "expires_at_ms": 1711234567000,
+            "accessToken": token,
+            "refreshToken": "refresh-token",
+            "expiresAt": 1711234567000,
+            "source": "pi_auth_json",
         },
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter._write_subscription_oauth_credentials",
+        lambda *args, **kwargs: None,
     )
 
     from hermes_cli.auth_commands import auth_add_command
@@ -122,11 +131,13 @@ def test_auth_add_anthropic_oauth_persists_pool_entry(tmp_path, monkeypatch):
 
     payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
     entries = payload["credential_pool"]["anthropic"]
-    entry = next(item for item in entries if item["source"] == "manual:hermes_pkce")
+    entry = next(item for item in entries if item["source"] == "claude_code")
     assert entry["label"] == "claude@example.com"
-    assert entry["source"] == "manual:hermes_pkce"
-    assert entry["refresh_token"] == "refresh-token"
-    assert entry["expires_at_ms"] == 1711234567000
+    assert entry["source"] == "claude_code"
+    # Subscription secrets live in ~/.pi/agent/auth.json — pool holds reference only.
+    assert "secret_fingerprint" in entry
+    assert "refresh_token" not in entry
+    assert "access_token" not in entry
 
 
 def test_auth_add_qwen_oauth_sets_active_provider(tmp_path, monkeypatch):

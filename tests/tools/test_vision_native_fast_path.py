@@ -275,6 +275,47 @@ class TestHandleVisionAnalyzeFastPath:
         assert isinstance(result, dict) and result.get("_multimodal") is True
         mock_aux.assert_not_called()
 
+    def test_auto_mode_auxiliary_vision_does_not_block_supported_main_model(self, tmp_path):
+        """A configured aux vision backend must not hide native vision in auto mode.
+
+        Regression for the gpt-5.5/openai-codex route: auxiliary.vision was
+        set to Anthropic, causing decide_image_input_mode() to resolve "text"
+        while the active model itself could see images. vision_analyze should
+        attach the image to the active model instead of falling through to
+        Moondream/auxiliary text.
+        """
+        img = tmp_path / "x.png"
+        img.write_bytes(_TINY_PNG)
+
+        async def _aux_sentinel(*args, **kwargs):
+            return '{"sentinel": "aux-path"}'
+
+        from agent.auxiliary_client import set_runtime_main, clear_runtime_main
+        set_runtime_main("openai-codex", "gpt-5.5")
+        try:
+            with patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "agent": {"image_input_mode": "auto"},
+                    "auxiliary": {
+                        "vision": {
+                            "provider": "anthropic",
+                            "model": "claude-haiku-4-5-20251001",
+                        },
+                    },
+                    "model": {"supports_vision": True},
+                },
+            ), patch(
+                "tools.vision_tools.vision_analyze_tool", side_effect=_aux_sentinel,
+            ) as mock_aux:
+                coro = _handle_vision_analyze({"image_url": str(img), "question": "?"})
+                result = asyncio.get_event_loop().run_until_complete(coro)
+        finally:
+            clear_runtime_main()
+
+        assert isinstance(result, dict) and result.get("_multimodal") is True
+        mock_aux.assert_not_called()
+
     def test_text_mode_wins_over_supports_vision_override(self, tmp_path):
         """Explicit text routing blocks the fast path even with supports_vision."""
         img = tmp_path / "x.png"
@@ -292,6 +333,10 @@ class TestHandleVisionAnalyzeFastPath:
                     "agent": {"image_input_mode": "text"},
                     "model": {"supports_vision": True},
                 },
+            ), patch(
+                "tools.vision_tools.check_vision_requirements", return_value=True,
+            ), patch(
+                "tools.vision_tools.check_pi_vision_requirements", return_value=False,
             ), patch(
                 "tools.vision_tools.vision_analyze_tool", side_effect=_aux_sentinel,
             ) as mock_aux:

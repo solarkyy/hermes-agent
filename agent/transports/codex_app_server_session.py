@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -92,13 +93,15 @@ class TurnResult:
 _TURN_ABORTED_MARKERS = ("<turn_aborted>", "<turn_aborted/>")
 
 
-def _coerce_turn_input_text(user_input: Any) -> str:
-    """Collapse Hermes/OpenAI rich content into app-server text input.
+_LOCAL_IMAGE_HINT_RE = re.compile(r"\[Image attached at: (?P<path>[^\]\n]+)\]")
 
-    The current `turn/start` path sends text items only. TUI image attachment
-    can hand us OpenAI-style content parts, so keep the text/path hints and
-    replace opaque image payloads with a small marker instead of putting a
-    Python list into the `text` field.
+
+def _coerce_turn_input_text(user_input: Any) -> str:
+    """Collapse Hermes/OpenAI rich content into plain text.
+
+    Kept for diagnostics and old tests. The live app-server path now uses
+    :func:`_build_turn_input_items` so image parts remain native multimodal
+    input instead of being reduced to text markers.
     """
     if isinstance(user_input, str):
         return user_input
@@ -118,11 +121,135 @@ def _coerce_turn_input_text(user_input: Any) -> str:
                 text = item.get("text") or item.get("content") or ""
                 if text:
                     parts.append(str(text))
-            elif item_type in {"image", "image_url", "input_image"}:
+            elif item_type in {"image", "image_url", "input_image", "localImage"}:
                 parts.append("[image attached]")
         text = "\n\n".join(p for p in parts if p).strip()
         return text or "What do you see in this image?"
     return "" if user_input is None else str(user_input)
+
+
+def _image_url_from_part(item: dict[str, Any]) -> str:
+    """Extract a URL string from OpenAI-style image content parts."""
+    image_url = item.get("image_url")
+    if isinstance(image_url, dict):
+        url = image_url.get("url") or image_url.get("image_url") or ""
+    else:
+        url = image_url or item.get("url") or item.get("image") or ""
+    return str(url).strip() if url is not None else ""
+
+
+def _path_from_file_url(url: str) -> str:
+    if not url.startswith("file://"):
+        return ""
+    try:
+        from urllib.parse import unquote, urlparse
+
+        parsed = urlparse(url)
+        if parsed.scheme != "file":
+            return ""
+        return unquote(parsed.path or "")
+    except Exception:
+        return ""
+
+
+def _local_image_hints_from_text(text: str) -> list[str]:
+    """Return existing local-image hint paths from a text content part."""
+    hints: list[str] = []
+    if not text:
+        return hints
+    for match in _LOCAL_IMAGE_HINT_RE.finditer(text):
+        raw = match.group("path").strip()
+        if not raw:
+            continue
+        expanded = os.path.expanduser(raw)
+        try:
+            if os.path.isfile(expanded):
+                hints.append(expanded)
+        except OSError:
+            continue
+    return hints
+
+
+def _build_turn_input_items(user_input: Any) -> list[dict[str, Any]]:
+    """Translate Hermes/OpenAI content into Codex app-server turn input.
+
+    Codex app-server accepts text, remote image URLs, and local image paths:
+      * {"type": "text", "text": "..."}
+      * {"type": "image", "url": "https://..."}
+      * {"type": "localImage", "path": "/tmp/screenshot.png"}
+
+    Hermes' native image pipeline passes OpenAI-style image_url parts. Local
+    files arrive as data: URLs plus a stable text hint emitted by
+    agent.image_routing.build_native_content_parts():
+    ``[Image attached at: /path/to/file.png]``. Prefer that path and send a
+    native ``localImage`` item, avoiding huge base64 blobs and letting Codex
+    read the file directly. Remote http(s) image URLs pass through as Codex
+    ``image`` items.
+    """
+    if isinstance(user_input, str):
+        return [{"type": "text", "text": user_input}]
+
+    if not isinstance(user_input, list):
+        return [{"type": "text", "text": "" if user_input is None else str(user_input)}]
+
+    input_items: list[dict[str, Any]] = []
+    local_hints: list[str] = []
+    next_hint = 0
+
+    for item in user_input:
+        if isinstance(item, str):
+            if item:
+                input_items.append({"type": "text", "text": item})
+                local_hints.extend(_local_image_hints_from_text(item))
+            continue
+        if not isinstance(item, dict):
+            if item is not None:
+                input_items.append({"type": "text", "text": str(item)})
+            continue
+
+        item_type = item.get("type")
+        if item_type in {"text", "input_text"}:
+            text = item.get("text") or item.get("content") or ""
+            text = str(text) if text is not None else ""
+            if text:
+                input_items.append({"type": "text", "text": text})
+                local_hints.extend(_local_image_hints_from_text(text))
+            continue
+
+        if item_type == "localImage":
+            path = str(item.get("path") or "").strip()
+            if path:
+                input_items.append({"type": "localImage", "path": os.path.expanduser(path)})
+            continue
+
+        if item_type in {"image", "image_url", "input_image"}:
+            path = str(item.get("path") or "").strip()
+            if path:
+                input_items.append({"type": "localImage", "path": os.path.expanduser(path)})
+                continue
+
+            url = _image_url_from_part(item)
+            file_path = _path_from_file_url(url)
+            if file_path:
+                input_items.append({"type": "localImage", "path": file_path})
+                continue
+
+            if url.startswith("data:") and next_hint < len(local_hints):
+                input_items.append({"type": "localImage", "path": local_hints[next_hint]})
+                next_hint += 1
+                continue
+
+            if url:
+                input_items.append({"type": "image", "url": url})
+            continue
+
+        # Unknown structured part: preserve a readable representation rather
+        # than dropping content silently.
+        input_items.append({"type": "text", "text": str(item)})
+
+    if not input_items:
+        input_items.append({"type": "text", "text": ""})
+    return input_items
 
 
 # Substrings in codex stderr / JSON-RPC error messages that signal the
@@ -403,16 +530,17 @@ class CodexAppServerSession:
         self._interrupt_event.clear()
         projector = CodexEventProjector()
 
-        user_input_text = _coerce_turn_input_text(user_input)
+        user_input_items = _build_turn_input_items(user_input)
 
-        # Send turn/start with the user input. Text-only for now (codex
-        # supports rich content but Hermes' text path is the common case).
+        # Send turn/start with native app-server input items. Text remains text;
+        # local image files become {type: localImage, path}; remote image URLs
+        # become {type: image, url}.
         try:
             ts = self._client.request(
                 "turn/start",
                 {
                     "threadId": self._thread_id,
-                    "input": [{"type": "text", "text": user_input_text}],
+                    "input": user_input_items,
                 },
                 timeout=10,
             )

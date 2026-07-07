@@ -23,6 +23,8 @@ from agent.model_metadata import (
     _strip_provider_prefix,
     estimate_tokens_rough,
     estimate_messages_tokens_rough,
+    estimate_request_token_breakdown_rough,
+    estimate_request_tokens_rough,
     get_model_context_length,
     get_next_probe_tier,
     get_cached_context_length,
@@ -118,6 +120,38 @@ class TestEstimateMessagesTokensRough:
         ]}
         result = estimate_messages_tokens_rough([msg])
         assert result < 5000
+
+
+class TestEstimateRequestTokenBreakdownRough:
+    def test_breakdown_total_matches_legacy_estimator(self):
+        messages = [{"role": "user", "content": "hello"}]
+        system_prompt = "s" * 40
+        tools = [{"type": "function", "function": {"name": "demo"}}]
+
+        breakdown = estimate_request_token_breakdown_rough(
+            messages,
+            system_prompt=system_prompt,
+            tools=tools,
+        )
+
+        assert breakdown == {
+            "system_prompt": estimate_tokens_rough(system_prompt),
+            "messages": estimate_messages_tokens_rough(messages),
+            "tools": estimate_tokens_rough(str(tools)),
+            "total": estimate_request_tokens_rough(
+                messages,
+                system_prompt=system_prompt,
+                tools=tools,
+            ),
+        }
+
+    def test_empty_request_breakdown_is_all_zero(self):
+        assert estimate_request_token_breakdown_rough([]) == {
+            "system_prompt": 0,
+            "messages": 0,
+            "tools": 0,
+            "total": 0,
+        }
 
 
 # =========================================================================

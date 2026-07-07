@@ -668,6 +668,17 @@ def classify_api_error(
             should_compress=True,
         )
 
+    # Anthropic OAuth "extra usage" (400) — usually a tool-name/count/lane mismatch
+    # on subscription OAuth, NOT true billing exhaustion. Rotating credentials
+    # makes things worse (pool marks claude_code DEAD while the token is fine).
+    if status_code == 400 and "extra usage" in error_msg:
+        return _result(
+            FailoverReason.billing,
+            retryable=False,
+            should_fallback=False,
+            should_rotate_credential=False,
+        )
+
     # Anthropic OAuth subscription rejects the 1M-context beta header.
     # Observed error body: "The long context beta is not yet available for
     # this subscription." Returned as HTTP 400 from native Anthropic when

@@ -430,7 +430,53 @@ def _compression_threshold_for_model(
         return _CODEX_GPT54_GPT55_COMPACTION_THRESHOLD
     if _is_codex_spark(model, provider):
         return _CODEX_SPARK_COMPACTION_THRESHOLD
+    # 2026-06-19 [AOMS-REFINE S3, Pi] — Opus bounded-growth history trim.
+    # Opus (claude-opus-4-8) has a 1,000,000-token context. Keep the threshold
+    # low enough to actually bind long-lived CLI sessions instead of waiting
+    # until ~950K tokens.
+    if model and "claude-opus" in model.lower():
+        return 0.35
     return None
+
+
+def _output_budget_override_for_model(
+    model: Optional[str], max_tokens, reasoning_config
+):
+    """Per-model output-budget override (2026-06-19 [AOMS-REFINE S4, Pi]).
+
+    Cap Opus effort + max_tokens to bound subscription-quota burn on the
+    output / adaptive-thinking side. Opus-ONLY; other models return
+    (None, None) so config is unchanged.
+
+    Returns (max_tokens_override_or_None, reasoning_config_override_or_None):
+      * max_tokens: capped to 4096 if currently higher. DB evidence: avg Opus
+        output ~706 tokens/call, so 4096 rarely binds — it only bounds
+        runaway long outputs. Tunable: raise to 6144/8192 if truncation hurts.
+      * effort: xhigh/max -> "high" (one step down; preserves most reasoning
+        depth, reduces adaptive-thinking output tokens). QUALITY-SENSITIVE:
+        capping trades Opus reasoning depth for quota. CURRENTLY DISABLED
+        per Kyle 2026-06-19 - Opus keeps full xhigh. Re-enable by uncommenting
+        the new_rc block below (only if confirmed to save base-allowance quota).
+    """
+    if not model or "claude-opus" not in model.lower():
+        return None, None
+    new_mt = None
+    try:
+        if max_tokens is not None and int(max_tokens) > 4096:
+            new_mt = 4096
+    except (TypeError, ValueError):
+        new_mt = None
+    # Effort cap DISABLED per Kyle 2026-06-19 - keep Opus at full xhigh
+    # reasoning depth. The max_tokens 4096 cap stays (bounds runaway output;
+    # avg Opus output ~706/call so it rarely binds). Re-enable effort saving
+    # by uncommenting the block below (only if Sparkmira confirms it saves
+    # base-allowance quota and Kyle is OK with less reasoning depth).
+    new_rc = None
+    # if isinstance(reasoning_config, dict):
+    #     eff = str(reasoning_config.get("effort", "")).lower()
+    #     if eff in ("xhigh", "max"):
+    #         new_rc = {**reasoning_config, "effort": "high"}
+    return new_mt, new_rc
 
 # Default auxiliary models for direct API-key providers (cheap/fast for side tasks)
 def _get_aux_model_for_provider(provider_id: str) -> str:
@@ -5335,7 +5381,7 @@ def resolve_vision_provider_client(
 
 def get_auxiliary_extra_body() -> dict:
     """Return extra_body kwargs for auxiliary API calls.
-    
+
     Includes Nous Portal product tags when the auxiliary client is backed
     by Nous Portal. Returns empty dict otherwise.
     """

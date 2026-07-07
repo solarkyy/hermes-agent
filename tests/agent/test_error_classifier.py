@@ -919,6 +919,17 @@ class TestClassifyApiError:
         result = classify_api_error(e, provider="anthropic")
         assert result.reason == FailoverReason.rate_limit
 
+    def test_anthropic_400_extra_usage_exhausted_no_fallback(self):
+        """400 'out of extra usage' on subscription OAuth → billing, no fallback."""
+        e = MockAPIError(
+            "You're out of extra usage. Add more at claude.ai/settings/usage and keep going.",
+            status_code=400,
+        )
+        result = classify_api_error(e, provider="anthropic", model="claude-sonnet-4-6")
+        assert result.reason == FailoverReason.billing
+        assert result.retryable is False
+        assert result.should_fallback is False
+
     # ── Provider-specific: Anthropic OAuth 1M-context beta forbidden ──
 
     def test_anthropic_oauth_1m_beta_forbidden(self):
@@ -1355,10 +1366,12 @@ class TestAdversarialEdgeCases:
         assert result.reason == FailoverReason.billing
 
     def test_400_anthropic_extra_usage_exhausted(self):
-        """Anthropic returns 400 with 'out of extra usage' when the user's
-        extra-usage allowance is depleted. Must classify as billing so the
-        fallback chain engages (with credential rotation) instead of the
-        generic format_error path, which never rotates. (#11736, #13170)"""
+        """Anthropic OAuth 'extra usage' 400 is billing-shaped but non-rotating.
+
+        On subscription OAuth this is often a tool-name/system-prompt lane
+        mismatch, not a dead credential. Mark billing for visibility, but do not
+        rotate/fallback-loop the same live Claude Code/Pi credential.
+        """
         e = MockAPIError(
             "You're out of extra usage. Add more at claude.ai/settings/usage and keep going.",
             status_code=400,
@@ -1369,9 +1382,9 @@ class TestAdversarialEdgeCases:
         )
         result = classify_api_error(e, provider="anthropic")
         assert result.reason == FailoverReason.billing
-        assert result.should_fallback is True
+        assert result.should_fallback is False
         assert result.retryable is False
-        assert result.should_rotate_credential is True
+        assert result.should_rotate_credential is False
 
     def test_200_with_error_body(self):
         """200 status with error in body — should be unknown, not crash."""
