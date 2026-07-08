@@ -2599,7 +2599,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception as exc:
                     logger.error("Detached SSE agent task failed after client disconnect %s: %s", completion_id, exc)
 
-            asyncio.create_task(_observe_detached_chat_task())
+            observer_task = asyncio.create_task(_observe_detached_chat_task())
+            self._background_tasks.add(observer_task)
+            observer_task.add_done_callback(self._background_tasks.discard)
             logger.info("SSE client disconnected; leaving agent task running %s", completion_id)
         except Exception as _exc:
             # Agent crashed mid-stream.  Try to emit an error chunk
@@ -3307,7 +3309,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     if store:
                         _persist_detached_failed(exc, error_type="server_error")
 
-            asyncio.create_task(_observe_detached_responses_task())
+            observer_task = asyncio.create_task(_observe_detached_responses_task())
+            self._background_tasks.add(observer_task)
+            observer_task.add_done_callback(self._background_tasks.discard)
             logger.info("SSE client disconnected; leaving agent task running %s", response_id)
         except asyncio.CancelledError:
             # Server-side cancellation (e.g. shutdown, request timeout) —
