@@ -2563,10 +2563,10 @@ class TestResponsesStreaming:
         assert "partial output" in output_text
 
     @pytest.mark.asyncio
-    async def test_stream_client_disconnect_persists_incomplete_snapshot(self, adapter):
-        """Client disconnect (ConnectionResetError) during streaming must
-        persist an ``incomplete`` snapshot in ResponseStore.  Regression
-        for PR #15171."""
+    async def test_stream_client_disconnect_detaches_and_persists_terminal_snapshot(self, adapter):
+        """Client disconnect (ConnectionResetError) during streaming must not
+        cancel unfinished agent work. The detached observer should persist the
+        terminal snapshot when the agent finishes."""
         fake_request = MagicMock()
         fake_request.headers = {}
 
@@ -2616,9 +2616,141 @@ class TestResponsesStreaming:
                 session_id=None,
             )
 
+        await agent_task
+        await asyncio.sleep(0.15)
+
         stored = adapter._response_store.get(response_id)
         assert stored is not None, "snapshot must survive client disconnect"
+        assert stored["response"]["status"] == "completed"
+        output_text = "".join(
+            part.get("text", "")
+            for item in stored["response"].get("output", [])
+            if item.get("type") == "message"
+            for part in item.get("content", [])
+        )
+        assert "some streamed text" in output_text
+
+    @pytest.mark.asyncio
+    async def test_stream_client_disconnect_then_agent_failure_persists_failed_snapshot(self, adapter):
+        """If the detached agent fails after the client disconnects, the
+        stored response must become terminal failed instead of in_progress."""
+        fake_request = MagicMock()
+        fake_request.headers = {}
+
+        write_call_count = {"n": 0}
+
+        class _DisconnectingStreamResponse:
+            async def prepare(self, req):
+                pass
+
+            async def write(self, payload):
+                write_call_count["n"] += 1
+                if write_call_count["n"] >= 3:
+                    raise ConnectionResetError("simulated client disconnect")
+
+        import gateway.platforms.api_server as api_mod
+        import queue as _q
+
+        stream_q: _q.Queue = _q.Queue()
+        stream_q.put("partial before failure")
+
+        async def _agent_coro():
+            await asyncio.sleep(0.01)
+            raise RuntimeError("detached boom")
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+
+        with patch.object(api_mod.web, "StreamResponse", return_value=_DisconnectingStreamResponse()):
+            await adapter._write_sse_responses(
+                request=fake_request,
+                response_id=response_id,
+                model="hermes-agent",
+                created_at=int(time.time()),
+                stream_q=stream_q,
+                agent_task=agent_task,
+                agent_ref=[None],
+                conversation_history=[],
+                user_message="will disconnect then fail",
+                instructions=None,
+                conversation=None,
+                store=True,
+                session_id=None,
+            )
+
+        with pytest.raises(RuntimeError):
+            await agent_task
+        await asyncio.sleep(0.15)
+
+        stored = adapter._response_store.get(response_id)
+        assert stored is not None
+        assert stored["response"]["status"] == "failed"
+        assert "detached boom" in stored["response"]["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_stream_client_disconnect_then_task_cancel_persists_incomplete_snapshot(self, adapter):
+        """Explicit/server cancellation after detach must not leave the stored
+        response permanently in_progress."""
+        fake_request = MagicMock()
+        fake_request.headers = {}
+
+        write_call_count = {"n": 0}
+
+        class _DisconnectingStreamResponse:
+            async def prepare(self, req):
+                pass
+
+            async def write(self, payload):
+                write_call_count["n"] += 1
+                if write_call_count["n"] >= 3:
+                    raise ConnectionResetError("simulated client disconnect")
+
+        import gateway.platforms.api_server as api_mod
+        import queue as _q
+
+        stream_q: _q.Queue = _q.Queue()
+        stream_q.put("partial before cancel")
+        agent_done = asyncio.Event()
+
+        async def _agent_coro():
+            await agent_done.wait()
+            return ({"final_response": "should not finish"}, {})
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+
+        with patch.object(api_mod.web, "StreamResponse", return_value=_DisconnectingStreamResponse()):
+            await adapter._write_sse_responses(
+                request=fake_request,
+                response_id=response_id,
+                model="hermes-agent",
+                created_at=int(time.time()),
+                stream_q=stream_q,
+                agent_task=agent_task,
+                agent_ref=[None],
+                conversation_history=[],
+                user_message="will disconnect then cancel",
+                instructions=None,
+                conversation=None,
+                store=True,
+                session_id=None,
+            )
+
+        agent_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await agent_task
+        await asyncio.sleep(0.15)
+
+        stored = adapter._response_store.get(response_id)
+        assert stored is not None
         assert stored["response"]["status"] == "incomplete"
+        output_text = "".join(
+            part.get("text", "")
+            for item in stored["response"].get("output", [])
+            if item.get("type") == "message"
+            for part in item.get("content", [])
+        )
+        assert "partial before cancel" in output_text
 
 
 # ---------------------------------------------------------------------------

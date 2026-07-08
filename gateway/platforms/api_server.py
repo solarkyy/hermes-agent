@@ -2410,8 +2410,9 @@ class APIServerAdapter(BasePlatformAdapter):
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
         If the client disconnects mid-stream (network drop, browser tab close),
-        the agent is interrupted via ``agent.interrupt()`` so it stops making
-        LLM API calls, and the asyncio task wrapper is cancelled.
+        the stream writer detaches and lets the agent task continue.  Explicit
+        cancellation must come from the stop endpoint; a dropped SSE transport
+        alone is not proof the user's task is done.
         """
         import queue as _q
 
@@ -2563,22 +2564,43 @@ class APIServerAdapter(BasePlatformAdapter):
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-            # Client disconnected mid-stream.  Interrupt the agent so it
-            # stops making LLM API calls at the next loop iteration, then
-            # cancel the asyncio task wrapper.
-            agent = agent_ref[0] if agent_ref else None
-            if agent is not None:
+            # Client disconnected mid-stream.  Do NOT interrupt/cancel the
+            # underlying agent: a dropped SSE connection (tab reload, proxy
+            # reset, mobile sleep) is a transport event, not a task-completion
+            # signal.  Leave explicit cancellation to the stop endpoint and
+            # observe the detached task so exceptions are not lost.
+            async def _observe_detached_chat_task() -> None:
                 try:
-                    agent.interrupt("SSE client disconnected")
-                except Exception:
-                    pass
-            if not agent_task.done():
-                agent_task.cancel()
-                try:
+                    saw_sentinel = False
+                    while not agent_task.done() and not saw_sentinel:
+                        while True:
+                            try:
+                                item = stream_q.get_nowait()
+                            except _q.Empty:
+                                break
+                            if item is None:
+                                saw_sentinel = True
+                                break
+                        if not saw_sentinel and not agent_task.done():
+                            await asyncio.sleep(0.05)
+
+                    # Drain any late items so a producer using a bounded queue
+                    # is not left blocked after the client transport is gone.
+                    while True:
+                        try:
+                            item = stream_q.get_nowait()
+                        except _q.Empty:
+                            break
+                        if item is None:
+                            break
                     await agent_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            logger.info("SSE client disconnected; interrupted agent task %s", completion_id)
+                except asyncio.CancelledError:
+                    logger.info("Detached SSE agent task cancelled after client disconnect: %s", completion_id)
+                except Exception as exc:
+                    logger.error("Detached SSE agent task failed after client disconnect %s: %s", completion_id, exc)
+
+            asyncio.create_task(_observe_detached_chat_task())
+            logger.info("SSE client disconnected; leaving agent task running %s", completion_id)
         except Exception as _exc:
             # Agent crashed mid-stream.  Try to emit an error chunk
             # so the client gets a proper response instead of a
@@ -2634,14 +2656,14 @@ class APIServerAdapter(BasePlatformAdapter):
           shape as the non-streaming path for parity)
         - ``response.failed`` — terminal event on agent error
 
-        If the client disconnects mid-stream, ``agent.interrupt()`` is
-        called so the agent stops issuing upstream LLM calls, then the
-        asyncio task is cancelled.  When ``store=True`` an initial
-        ``in_progress`` snapshot is persisted immediately after
-        ``response.created`` and disconnects update it to an
-        ``incomplete`` snapshot so GET /v1/responses/{id} and
-        ``previous_response_id`` chaining still have something to
-        recover from.
+        If the client disconnects mid-stream, the writer detaches and lets
+        the agent continue.  A dropped SSE transport is not a task-completion
+        or cancellation signal; explicit cancellation must come from the stop
+        endpoint.  When ``store=True`` an initial ``in_progress`` snapshot is
+        persisted immediately after ``response.created`` and a detached
+        background observer updates it to a terminal snapshot when the agent
+        finishes, so GET /v1/responses/{id} and ``previous_response_id``
+        chaining can recover the completed work.
         """
         import queue as _q
 
@@ -2729,10 +2751,11 @@ class APIServerAdapter(BasePlatformAdapter):
         def _persist_incomplete_if_needed() -> None:
             """Persist an ``incomplete`` snapshot if no terminal one was written.
 
-            Called from both the client-disconnect (``ConnectionResetError``)
-            and server-cancellation (``asyncio.CancelledError``) paths so
-            GET /v1/responses/{id} and ``previous_response_id`` chaining keep
-            working after abrupt stream termination.
+            Called from server-cancellation (``asyncio.CancelledError``) and
+            crash paths so GET /v1/responses/{id} and ``previous_response_id``
+            chaining keep working after abrupt stream termination. Client
+            disconnects instead detach and persist a terminal snapshot when the
+            agent finishes.
             """
             if not store or terminal_snapshot_persisted:
                 return
@@ -3135,22 +3158,157 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
 
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-            _persist_incomplete_if_needed()
-            # Client disconnected — interrupt the agent so it stops
-            # making upstream LLM calls, then cancel the task.
-            agent = agent_ref[0] if agent_ref else None
-            if agent is not None:
+            # Client disconnected.  Keep the agent running; a stream transport
+            # drop is not consent to stop unfinished work.  If response storage
+            # is enabled, a detached observer promotes the initial in_progress
+            # snapshot to completed/failed when the agent finishes.
+            async def _observe_detached_responses_task() -> None:
+                nonlocal terminal_snapshot_persisted
+
+                def _record_detached_item(item: Any) -> bool:
+                    """Drain a queued SSE item into persistent state.
+
+                    Returns True when an EOS sentinel was seen. We intentionally
+                    avoid writing to the dead client transport here; the goal is
+                    only to keep queued output recoverable and avoid producer
+                    blockage after disconnect.
+                    """
+                    if item is None:
+                        return True
+                    if isinstance(item, str):
+                        final_text_parts.append(item)
+                        return False
+                    if not (isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str)):
+                        return False
+
+                    tag, payload = item
+                    if not isinstance(payload, dict):
+                        return False
+                    if tag == "__tool_started__":
+                        args = payload.get("arguments", {})
+                        arguments_str = json.dumps(args) if isinstance(args, dict) else str(args)
+                        emitted_items.append({
+                            "type": "function_call",
+                            "name": payload.get("name", ""),
+                            "arguments": arguments_str,
+                            "call_id": payload.get("tool_call_id") or f"call_{response_id[5:]}_detached",
+                        })
+                    elif tag == "__tool_completed__":
+                        result = payload.get("result", "")
+                        result_str = result if isinstance(result, str) else json.dumps(result)
+                        emitted_items.append({
+                            "type": "function_call_output",
+                            "call_id": payload.get("tool_call_id") or f"call_{response_id[5:]}_detached",
+                            "output": [{"type": "input_text", "text": result_str}],
+                        })
+                    return False
+
+                def _persist_detached_failed(message: Any, *, error_type: str = "agent_error") -> None:
+                    nonlocal terminal_snapshot_persisted
+                    failed_env = _envelope("failed")
+                    failed_env["output"] = list(emitted_items)
+                    text = "".join(final_text_parts) or final_response_text
+                    if text:
+                        failed_env["output"].append({
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": text}],
+                        })
+                    failed_env["error"] = {"message": _redact_api_error_text(message, limit=500), "type": error_type}
+                    failed_env["usage"] = {
+                        "input_tokens": usage.get("input_tokens", 0),
+                        "output_tokens": usage.get("output_tokens", 0),
+                        "total_tokens": usage.get("total_tokens", 0),
+                    }
+                    failed_history = list(conversation_history)
+                    failed_history.append({"role": "user", "content": user_message})
+                    if text or message:
+                        failed_history.append({"role": "assistant", "content": text or _redact_api_error_text(message, limit=500)})
+                    _persist_response_snapshot(failed_env, conversation_history_snapshot=failed_history)
+                    terminal_snapshot_persisted = True
+
                 try:
-                    agent.interrupt("SSE client disconnected")
-                except Exception:
-                    pass
-            if not agent_task.done():
-                agent_task.cancel()
-                try:
-                    await agent_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            logger.info("SSE client disconnected; interrupted agent task %s", response_id)
+                    saw_sentinel = False
+                    while not agent_task.done() and not saw_sentinel:
+                        while True:
+                            try:
+                                item = stream_q.get_nowait()
+                            except _q.Empty:
+                                break
+                            saw_sentinel = _record_detached_item(item) or saw_sentinel
+                        if not saw_sentinel and not agent_task.done():
+                            await asyncio.sleep(0.05)
+                    while True:
+                        try:
+                            item = stream_q.get_nowait()
+                        except _q.Empty:
+                            break
+                        saw_sentinel = _record_detached_item(item) or saw_sentinel
+
+                    result, agent_usage = await agent_task
+                    detached_usage = agent_usage or usage
+                    detached_text = ""
+                    if isinstance(result, dict):
+                        detached_text = str(result.get("final_response") or "")
+                    if not detached_text:
+                        detached_text = "".join(final_text_parts) or final_response_text
+
+                    detached_items: List[Dict[str, Any]] = list(emitted_items)
+                    detached_items.append({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": detached_text}],
+                    })
+
+                    detached_failed = bool(result.get("failed")) if isinstance(result, dict) else False
+                    detached_error = result.get("error") if isinstance(result, dict) else None
+                    if detached_failed or detached_error:
+                        failed_env = _envelope("failed")
+                        failed_env["output"] = detached_items
+                        failed_env["error"] = {
+                            "message": _redact_api_error_text(detached_error or "agent failed", limit=500),
+                            "type": "agent_error",
+                        }
+                        failed_env["usage"] = {
+                            "input_tokens": detached_usage.get("input_tokens", 0),
+                            "output_tokens": detached_usage.get("output_tokens", 0),
+                            "total_tokens": detached_usage.get("total_tokens", 0),
+                        }
+                        failed_history = list(conversation_history)
+                        failed_history.append({"role": "user", "content": user_message})
+                        if detached_text or detached_error:
+                            failed_history.append({
+                                "role": "assistant",
+                                "content": detached_text or _redact_api_error_text(detached_error, limit=500),
+                            })
+                        _persist_response_snapshot(failed_env, conversation_history_snapshot=failed_history)
+                    else:
+                        completed_env = _envelope("completed")
+                        completed_env["output"] = detached_items
+                        completed_env["usage"] = {
+                            "input_tokens": detached_usage.get("input_tokens", 0),
+                            "output_tokens": detached_usage.get("output_tokens", 0),
+                            "total_tokens": detached_usage.get("total_tokens", 0),
+                        }
+                        full_history = self._build_response_conversation_history(
+                            conversation_history,
+                            user_message,
+                            result,
+                            detached_text,
+                        )
+                        _persist_response_snapshot(completed_env, conversation_history_snapshot=full_history)
+                    terminal_snapshot_persisted = True
+                except asyncio.CancelledError:
+                    _persist_incomplete_if_needed()
+                    terminal_snapshot_persisted = True
+                    logger.info("Detached SSE responses agent task cancelled after client disconnect: %s", response_id)
+                except Exception as exc:
+                    logger.error("Detached SSE responses agent task failed after client disconnect %s: %s", response_id, exc)
+                    if store:
+                        _persist_detached_failed(exc, error_type="server_error")
+
+            asyncio.create_task(_observe_detached_responses_task())
+            logger.info("SSE client disconnected; leaving agent task running %s", response_id)
         except asyncio.CancelledError:
             # Server-side cancellation (e.g. shutdown, request timeout) —
             # persist an incomplete snapshot so GET /v1/responses/{id} and

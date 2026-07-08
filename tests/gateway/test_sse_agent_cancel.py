@@ -1,9 +1,9 @@
-"""Tests for SSE client disconnect → agent task cancellation.
+"""Tests for SSE client disconnect → detached agent continuation.
 
 When a streaming /v1/chat/completions client disconnects mid-stream
-(network drop, browser tab close), the agent is interrupted via
-agent.interrupt() so it stops making LLM API calls, and the asyncio
-task wrapper is cancelled.
+(network drop, browser tab close), Hermes must not treat that transport
+failure as task completion or cancellation. The agent keeps running; explicit
+stop/cancel remains available through the stop endpoint.
 """
 
 import asyncio
@@ -37,18 +37,17 @@ def _make_request():
 # Tests
 # ---------------------------------------------------------------------------
 
-class TestSSEAgentCancelOnDisconnect:
+class TestSSEAgentContinueOnDisconnect:
     """gateway/platforms/api_server.py — _write_sse_chat_completion()"""
 
-    def test_agent_task_cancelled_on_client_disconnect(self):
+    def test_agent_task_keeps_running_on_client_disconnect(self):
         """When response.write raises ConnectionResetError (client dropped),
-        the agent task must be cancelled."""
+        the agent task must be left running."""
         adapter = _make_adapter()
 
         stream_q = queue.Queue()
         stream_q.put("hello ")  # Some data already queued
 
-        # Agent task that runs forever (simulates a long LLM call)
         agent_done = asyncio.Event()
 
         async def fake_agent():
@@ -83,10 +82,14 @@ class TestSSEAgentCancelOnDisconnect:
                         stream_q, agent_task,
                     )
 
-            # The critical assertion: agent_task must be cancelled
-            assert agent_task.cancelled() or agent_task.done()
-            # Clean up
+            # The critical assertion: transport disconnect must not cancel the task.
+            assert not agent_task.cancelled()
+            assert not agent_task.done()
+            # Clean up and let the detached observer finish.
             agent_done.set()
+            stream_q.put(None)
+            await agent_task
+            await asyncio.sleep(0)
 
         asyncio.run(run())
 
@@ -124,14 +127,15 @@ class TestSSEAgentCancelOnDisconnect:
 
         asyncio.run(run())
 
-    def test_broken_pipe_also_cancels_agent(self):
-        """BrokenPipeError (another disconnect variant) also cancels the task."""
+    def test_broken_pipe_also_keeps_agent_running(self):
+        """BrokenPipeError (another disconnect variant) also leaves the task running."""
         adapter = _make_adapter()
 
         stream_q = queue.Queue()
+        agent_done = asyncio.Event()
 
         async def fake_agent():
-            await asyncio.sleep(999)  # Never completes
+            await agent_done.wait()
             return {}, {}
 
         async def run():
@@ -150,7 +154,12 @@ class TestSSEAgentCancelOnDisconnect:
                     stream_q, agent_task,
                 )
 
-            assert agent_task.cancelled() or agent_task.done()
+            assert not agent_task.cancelled()
+            assert not agent_task.done()
+            agent_done.set()
+            stream_q.put(None)
+            await agent_task
+            await asyncio.sleep(0)
 
         asyncio.run(run())
 
@@ -192,12 +201,13 @@ class TestSSEAgentCancelOnDisconnect:
             # Task was already done — should not be cancelled
             assert agent_task.done()
             assert not agent_task.cancelled()
+            await asyncio.sleep(0)
 
         asyncio.run(run())
 
-    def test_agent_interrupt_called_on_disconnect(self):
-        """When the client disconnects, agent.interrupt() must be called
-        so the agent thread stops making LLM API calls."""
+    def test_agent_interrupt_not_called_on_disconnect(self):
+        """Client disconnect is not an explicit stop request, so agent.interrupt()
+        must not be called."""
         adapter = _make_adapter()
 
         stream_q = queue.Queue()
@@ -238,22 +248,28 @@ class TestSSEAgentCancelOnDisconnect:
                     stream_q, agent_task, agent_ref,
                 )
 
-            # agent.interrupt() must have been called
-            mock_agent.interrupt.assert_called_once_with("SSE client disconnected")
-            # Clean up
+            # agent.interrupt() must NOT have been called.
+            mock_agent.interrupt.assert_not_called()
+            assert not agent_task.cancelled()
+            assert not agent_task.done()
+            # Clean up and let the detached observer finish.
             agent_done.set()
+            stream_q.put(None)
+            await agent_task
+            await asyncio.sleep(0)
 
         asyncio.run(run())
 
-    def test_agent_ref_none_still_cancels_task(self):
-        """When agent_ref is not provided (None), the task is still cancelled
-        on disconnect — just without the interrupt() call."""
+    def test_agent_ref_none_still_keeps_task_running(self):
+        """When agent_ref is not provided (None), the task still keeps running
+        on disconnect."""
         adapter = _make_adapter()
 
         stream_q = queue.Queue()
+        agent_done = asyncio.Event()
 
         async def fake_agent():
-            await asyncio.sleep(999)
+            await agent_done.wait()
             return {}, {}
 
         async def run():
@@ -273,7 +289,12 @@ class TestSSEAgentCancelOnDisconnect:
                     stream_q, agent_task,
                 )
 
-            assert agent_task.cancelled() or agent_task.done()
+            assert not agent_task.cancelled()
+            assert not agent_task.done()
+            agent_done.set()
+            stream_q.put(None)
+            await agent_task
+            await asyncio.sleep(0)
 
         asyncio.run(run())
 
