@@ -1,0 +1,12 @@
+name: omni_pulse
+version: "0.2"
+description: >
+  Per-turn live organism grounding for Hermes. Registers a pre_llm_call hook that
+  injects a compact, bounded, secret-scrubbed live serve.js snapshot (EQ + mesh)
+  into the USER message — preserving the cached system-prompt prefix and
+  sidestepping the subscription-OAuth tool cap (context, not tools). Opt-in;
+  fail-safe; council excluded by default. Configure with OMNI_PULSE_* env after
+  enabling.
+author: OMNIRA
+provides_hooks:
+  - pre_llm_call
